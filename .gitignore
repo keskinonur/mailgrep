@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# output
+downloads/
+archive/
+
+# binaries
+mailgrep
+mailgrep-*
+*.exe
+
+# env files
+.env
+.env.local
+
+# lock files (bun.lock is fine, but not npm)
+package-lock.json
+
+# caches
+.cache/
+*.tsbuildinfo
+
+# system
+.DS_Store
+Thumbs.db
