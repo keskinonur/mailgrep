@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
