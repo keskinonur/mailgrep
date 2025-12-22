@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.4";
+const VERSION = "1.0.5";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
@@ -138,6 +138,7 @@ interface CLIOptions {
   start?: string;
   end?: string;
   output?: string;
+  user?: string;  // --user to select cached account
   dryRun: boolean;
   verbose: boolean;
   quiet: boolean;
@@ -529,13 +530,14 @@ function findDuplicates(entries: ManifestEntry[]): DuplicateGroup[] {
 
 const TOKEN_CACHE_DIR = join(homedir(), ".mailgrep");
 const TOKEN_CACHE_PATH = join(TOKEN_CACHE_DIR, "tokens.json");
-const TOKEN_CACHE_VERSION = 1;
+const TOKEN_CACHE_VERSION = 2;  // v2: keyed by userEmail, normalized casing
 
 async function loadTokenCache(): Promise<TokenCacheFile> {
   try {
     const file = Bun.file(TOKEN_CACHE_PATH);
     if (await file.exists()) {
-      return await file.json() as TokenCacheFile;
+      const cache = await file.json() as TokenCacheFile;
+      return migrateTokenCache(cache);
     }
   } catch {
     // Ignore errors, return empty cache
@@ -543,27 +545,52 @@ async function loadTokenCache(): Promise<TokenCacheFile> {
   return { version: TOKEN_CACHE_VERSION, tokens: [] };
 }
 
+function migrateTokenCache(cache: TokenCacheFile): TokenCacheFile {
+  // Migration from v1 to v2: normalize userEmail casing, remove invalid entries
+  if (cache.version < 2) {
+    cache.tokens = cache.tokens
+      .filter(t => t.userEmail && t.userEmail !== "unknown")  // Remove invalid entries
+      .map(t => ({
+        ...t,
+        userEmail: t.userEmail.toLowerCase(),  // Normalize casing
+      }));
+    cache.version = 2;
+  }
+  return cache;
+}
+
 async function saveTokenCache(cache: TokenCacheFile): Promise<void> {
   await Bun.$`mkdir -p ${TOKEN_CACHE_DIR}`.quiet();
   await Bun.write(TOKEN_CACHE_PATH, JSON.stringify(cache, null, 2));
 }
 
-function getCachedToken(cache: TokenCacheFile, tenantId: string): TokenCache | undefined {
-  // Find all tokens for this tenant, return most recently cached one
-  // This supports multiple users per tenant without collision
-  const tenantTokens = cache.tokens
+function getCachedTokensForTenant(cache: TokenCacheFile, tenantId: string): TokenCache[] {
+  // Get all tokens for this tenant, sorted by most recently cached
+  return cache.tokens
     .filter(t => t.tenantId === tenantId)
     .sort((a, b) => new Date(b.cachedAt).getTime() - new Date(a.cachedAt).getTime());
-  return tenantTokens[0];
+}
+
+function getCachedToken(cache: TokenCacheFile, tenantId: string, userEmail?: string): TokenCache | undefined {
+  const tenantTokens = getCachedTokensForTenant(cache, tenantId);
+
+  if (userEmail) {
+    // Explicit user selection via --user flag
+    return tenantTokens.find(t => t.userEmail.toLowerCase() === userEmail.toLowerCase());
+  }
+
+  // If only one token for tenant, use it; otherwise return undefined to trigger prompt
+  return tenantTokens.length === 1 ? tenantTokens[0] : undefined;
 }
 
 function setCachedToken(cache: TokenCacheFile, token: TokenCache): void {
-  // Key by userEmail to support multiple users per tenant
-  const index = cache.tokens.findIndex(t => t.userEmail.toLowerCase() === token.userEmail.toLowerCase());
+  // Key by userEmail (normalized) to support multiple users per tenant
+  const normalizedEmail = token.userEmail.toLowerCase();
+  const index = cache.tokens.findIndex(t => t.userEmail.toLowerCase() === normalizedEmail);
   if (index >= 0) {
-    cache.tokens[index] = token;
+    cache.tokens[index] = { ...token, userEmail: normalizedEmail };
   } else {
-    cache.tokens.push(token);
+    cache.tokens.push({ ...token, userEmail: normalizedEmail });
   }
 }
 
@@ -1034,7 +1061,40 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     }
 
     const tokenCache = await loadTokenCache();
-    const cachedToken = getCachedToken(tokenCache, OAUTH_CONFIG.tenantId);
+
+    // Check if multiple users exist for this tenant and no --user specified
+    const tenantTokens = getCachedTokensForTenant(tokenCache, OAUTH_CONFIG.tenantId);
+    let selectedUser = options.user;
+
+    if (tenantTokens.length > 1 && !selectedUser) {
+      // Multiple accounts cached, prompt user to select
+      authSpinner.stop();
+      console.log();
+      console.log(chalk.bold("Multiple cached accounts found:"));
+      tenantTokens.forEach((t, i) => {
+        console.log(`  ${chalk.cyan(i + 1)}. ${t.userEmail}`);
+      });
+      console.log(`  ${chalk.cyan(tenantTokens.length + 1)}. Login as different user`);
+      console.log();
+
+      const rl = createPrompt();
+      const answer = await new Promise<string>((resolve) => {
+        rl.question(chalk.cyan("Select account (number): "), resolve);
+      });
+      rl.close();
+
+      const choice = parseInt(answer, 10);
+      if (choice >= 1 && choice <= tenantTokens.length) {
+        selectedUser = tenantTokens[choice - 1].userEmail;
+      } else {
+        // User wants to login as different user
+        throw new Error("user_selected_new_login");
+      }
+
+      authSpinner.start("Authenticating with Office 365...");
+    }
+
+    const cachedToken = getCachedToken(tokenCache, OAUTH_CONFIG.tenantId, selectedUser);
 
     if (cachedToken) {
       if (!isTokenExpired(cachedToken)) {
@@ -1072,12 +1132,12 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
         throw new Error("no_refresh_token");
       }
     } else {
-      // No cached token, need browser auth
+      // No cached token (or --user specified non-existent user), need browser auth
       throw new Error("no_cached_token");
     }
   } catch (error) {
     // Fall back to browser authentication
-    if (error instanceof Error && !["refresh_failed", "no_refresh_token", "no_cached_token", "force_reauth"].includes(error.message)) {
+    if (error instanceof Error && !["refresh_failed", "no_refresh_token", "no_cached_token", "force_reauth", "user_selected_new_login"].includes(error.message)) {
       // Real error, re-throw
       authSpinner.fail("Authentication failed");
       throw error;
@@ -1486,6 +1546,7 @@ program
   .option("--dedupe", "remove duplicate files (keeps oldest, preserves cache)", false)
   .option("--logout", "clear cached authentication tokens", false)
   .option("--reauth", "force re-authentication (ignore cached tokens)", false)
+  .option("-u, --user <email>", "use specific cached account (skip prompt)")
   .option("-v, --verbose", "show detailed logs", false)
   .option("-q, --quiet", "minimal output", false)
   .action(async (options: CLIOptions) => {

@@ -73,6 +73,7 @@ mailgrep --dedupe
 | `--rebuild-hashes` | Recalculate file hashes |
 | `--logout` | Clear cached auth tokens |
 | `--reauth` | Force browser re-authentication |
+| `-u, --user <email>` | Use specific cached account |
 | `-v, --verbose` | Detailed output |
 | `-q, --quiet` | Minimal output |
 
