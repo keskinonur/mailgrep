@@ -13,9 +13,20 @@ mailgrep-*
 # env files
 .env
 .env.local
+.env.*
+!.env.example
 
-# lock files (bun.lock is fine, but not npm)
+# auth tokens (normally in ~/.mailgrep/, but ignore if copied here)
+.mailgrep/
+tokens.json
+
+# lock files (bun.lock is fine, but not npm/yarn)
 package-lock.json
+yarn.lock
+
+# bun
+*.bun-build
+bun.lockb
 
 # caches
 .cache/
@@ -24,3 +35,9 @@ package-lock.json
 # system
 .DS_Store
 Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.1";
+const VERSION = "1.0.3";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
@@ -146,6 +146,8 @@ interface CLIOptions {
   checkDuplicates: boolean;
   rebuildHashes: boolean;
   dedupe: boolean;
+  logout: boolean;
+  reauth: boolean;
 }
 
 // ============================================
@@ -178,6 +180,26 @@ interface Manifest {
   version: number;          // Schema version for future migrations
   updatedAt: string;        // Last manifest update
   accounts: UserSenderManifest[];  // Supports multiple user+sender combos
+}
+
+// ============================================
+// Token Cache Types - Persistent Authentication
+// ============================================
+// Stores OAuth tokens to avoid re-authentication on every run
+// Tokens are cached per-tenant in ~/.mailgrep/tokens.json
+
+interface TokenCache {
+  tenantId: string;
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;        // Unix timestamp (ms) when access token expires
+  userEmail: string;
+  cachedAt: string;         // ISO date when cached
+}
+
+interface TokenCacheFile {
+  version: number;
+  tokens: TokenCache[];     // Multiple accounts supported
 }
 
 // ============================================
@@ -500,9 +522,105 @@ function findDuplicates(entries: ManifestEntry[]): DuplicateGroup[] {
 }
 
 // ============================================
+// Token Cache Helpers
+// ============================================
+// Caches OAuth tokens to avoid browser login on every run
+// Stored in ~/.mailgrep/tokens.json for security (not in project dir)
+
+const TOKEN_CACHE_DIR = join(homedir(), ".mailgrep");
+const TOKEN_CACHE_PATH = join(TOKEN_CACHE_DIR, "tokens.json");
+const TOKEN_CACHE_VERSION = 1;
+
+async function loadTokenCache(): Promise<TokenCacheFile> {
+  try {
+    const file = Bun.file(TOKEN_CACHE_PATH);
+    if (await file.exists()) {
+      return await file.json() as TokenCacheFile;
+    }
+  } catch {
+    // Ignore errors, return empty cache
+  }
+  return { version: TOKEN_CACHE_VERSION, tokens: [] };
+}
+
+async function saveTokenCache(cache: TokenCacheFile): Promise<void> {
+  await Bun.$`mkdir -p ${TOKEN_CACHE_DIR}`.quiet();
+  await Bun.write(TOKEN_CACHE_PATH, JSON.stringify(cache, null, 2));
+}
+
+function getCachedToken(cache: TokenCacheFile, tenantId: string): TokenCache | undefined {
+  return cache.tokens.find(t => t.tenantId === tenantId);
+}
+
+function setCachedToken(cache: TokenCacheFile, token: TokenCache): void {
+  const index = cache.tokens.findIndex(t => t.tenantId === token.tenantId);
+  if (index >= 0) {
+    cache.tokens[index] = token;
+  } else {
+    cache.tokens.push(token);
+  }
+}
+
+function isTokenExpired(token: TokenCache): boolean {
+  // Add 60 second buffer to avoid edge cases
+  return Date.now() >= (token.expiresAt - 60000);
+}
+
+function getTokenExpiry(accessToken: string): number {
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length !== 3) return Date.now();
+    const payload = JSON.parse(atob(parts[1]));
+    // JWT exp is in seconds, convert to ms
+    return (payload.exp || 0) * 1000;
+  } catch {
+    return Date.now();
+  }
+}
+
+async function refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; expiresAt: number } | null> {
+  try {
+    const response = await fetch(OAUTH_CONFIG.tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: OAUTH_CONFIG.clientId,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        scope: OAUTH_CONFIG.scopes.join(" "),
+      }),
+    });
+
+    const data = await response.json() as {
+      access_token?: string;
+      refresh_token?: string;
+      error?: string;
+    };
+
+    if (data.error || !data.access_token) {
+      return null;
+    }
+
+    return {
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token || refreshToken, // May return new refresh token
+      expiresAt: getTokenExpiry(data.access_token),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ============================================
 // Interactive Browser Authentication
 // ============================================
-async function authenticate(spinner: Ora): Promise<string> {
+interface AuthResult {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+}
+
+async function authenticate(spinner: Ora): Promise<AuthResult> {
   return new Promise((resolve, reject) => {
     // Use crypto.randomUUID for secure state
     const state = crypto.randomUUID();
@@ -569,6 +687,7 @@ async function authenticate(spinner: Ora): Promise<string> {
 
             const tokenData = (await tokenResponse.json()) as {
               access_token?: string;
+              refresh_token?: string;
               error?: string;
               error_description?: string;
             };
@@ -585,7 +704,11 @@ async function authenticate(spinner: Ora): Promise<string> {
 
             setTimeout(() => {
               server.stop();
-              resolve(tokenData.access_token!);
+              resolve({
+                accessToken: tokenData.access_token!,
+                refreshToken: tokenData.refresh_token || "",
+                expiresAt: getTokenExpiry(tokenData.access_token!),
+              });
             }, 100);
 
             return new Response(successPage(), {
@@ -826,7 +949,7 @@ function expandPath(path: string): string {
 // 6. Save manifest (also on Ctrl+C)
 // 7. Display summary
 
-async function run(options: CLIOptions): Promise<void> {
+async function run(options: CLIOptions, forceReauth: boolean = false): Promise<void> {
   logger = new Logger(options.verbose, options.quiet);
   const startTime = new Date();
 
@@ -852,17 +975,89 @@ async function run(options: CLIOptions): Promise<void> {
     await Bun.$`mkdir -p ${config.outputDir}`.quiet();
   }
 
-  // Authenticate
+  // Authenticate - try cached token first, then refresh, then browser
   const authSpinner = ora("Authenticating with Office 365...").start();
   let accessToken: string;
   let userEmail: string;
+
   try {
-    accessToken = await authenticate(authSpinner);
-    userEmail = getUserEmailFromToken(accessToken);
-    authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+    // Skip cache if --reauth flag is set
+    if (forceReauth) {
+      throw new Error("force_reauth");
+    }
+
+    const tokenCache = await loadTokenCache();
+    const cachedToken = getCachedToken(tokenCache, OAUTH_CONFIG.tenantId);
+
+    if (cachedToken) {
+      if (!isTokenExpired(cachedToken)) {
+        // Use cached token directly
+        accessToken = cachedToken.accessToken;
+        userEmail = cachedToken.userEmail;
+        authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)} ${chalk.dim("(cached)")}`);
+      } else if (cachedToken.refreshToken) {
+        // Token expired, try refresh
+        authSpinner.text = "Refreshing authentication...";
+        const refreshed = await refreshAccessToken(cachedToken.refreshToken);
+
+        if (refreshed) {
+          accessToken = refreshed.accessToken;
+          userEmail = getUserEmailFromToken(accessToken);
+
+          // Update cache with new tokens
+          setCachedToken(tokenCache, {
+            tenantId: OAUTH_CONFIG.tenantId,
+            accessToken: refreshed.accessToken,
+            refreshToken: refreshed.refreshToken,
+            expiresAt: refreshed.expiresAt,
+            userEmail,
+            cachedAt: new Date().toISOString(),
+          });
+          await saveTokenCache(tokenCache);
+
+          authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)} ${chalk.dim("(refreshed)")}`);
+        } else {
+          // Refresh failed, need browser auth
+          throw new Error("refresh_failed");
+        }
+      } else {
+        // No refresh token, need browser auth
+        throw new Error("no_refresh_token");
+      }
+    } else {
+      // No cached token, need browser auth
+      throw new Error("no_cached_token");
+    }
   } catch (error) {
-    authSpinner.fail("Authentication failed");
-    throw error;
+    // Fall back to browser authentication
+    if (error instanceof Error && !["refresh_failed", "no_refresh_token", "no_cached_token", "force_reauth"].includes(error.message)) {
+      // Real error, re-throw
+      authSpinner.fail("Authentication failed");
+      throw error;
+    }
+
+    try {
+      const authResult = await authenticate(authSpinner);
+      accessToken = authResult.accessToken;
+      userEmail = getUserEmailFromToken(accessToken);
+
+      // Save tokens to cache
+      const tokenCache = await loadTokenCache();
+      setCachedToken(tokenCache, {
+        tenantId: OAUTH_CONFIG.tenantId,
+        accessToken: authResult.accessToken,
+        refreshToken: authResult.refreshToken,
+        expiresAt: authResult.expiresAt,
+        userEmail,
+        cachedAt: new Date().toISOString(),
+      });
+      await saveTokenCache(tokenCache);
+
+      authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+    } catch (authError) {
+      authSpinner.fail("Authentication failed");
+      throw authError;
+    }
   }
 
   // Load manifest for incremental backup
@@ -1242,6 +1437,8 @@ program
   .option("--check-duplicates", "analyze and report duplicate files", false)
   .option("--rebuild-hashes", "calculate hashes for existing files (for duplicate detection)", false)
   .option("--dedupe", "remove duplicate files (keeps oldest, preserves cache)", false)
+  .option("--logout", "clear cached authentication tokens", false)
+  .option("--reauth", "force re-authentication (ignore cached tokens)", false)
   .option("-v, --verbose", "show detailed logs", false)
   .option("-q, --quiet", "minimal output", false)
   .action(async (options: CLIOptions) => {
@@ -1250,6 +1447,30 @@ program
     // Show banner unless in quiet mode
     if (!options.quiet) {
       showBanner();
+    }
+
+    // Handle --logout
+    if (options.logout) {
+      const tokenCache = await loadTokenCache();
+
+      console.log();
+      console.log(chalk.bold("Logout"));
+      console.log(chalk.dim("─".repeat(50)));
+
+      if (tokenCache.tokens.length === 0) {
+        console.log(chalk.dim("  No cached tokens found."));
+      } else {
+        for (const token of tokenCache.tokens) {
+          console.log(`  ${chalk.cyan(token.userEmail)} (${token.tenantId})`);
+        }
+        tokenCache.tokens = [];
+        await saveTokenCache(tokenCache);
+        console.log();
+        console.log(chalk.green("✓ All cached tokens cleared"));
+      }
+
+      console.log();
+      process.exit(ExitCode.Success);
     }
 
     // Handle --show-accounts
@@ -1447,7 +1668,7 @@ program
     }
 
     try {
-      await run(options);
+      await run(options, options.reauth);
       process.exit(ExitCode.Success);
     } catch (error) {
       if (error instanceof Error) {

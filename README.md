@@ -16,6 +16,7 @@ Download email attachments from Office 365 with a single command.
 
 ## Features
 
+- **Persistent Login** - Caches auth tokens so you don't need to login every time
 - **Incremental Backup** - Only downloads new files, resumes where you left off
 - **Duplicate Detection** - Finds and removes duplicate attachments from email threads
 - **Configurable Filters** - Download images, PDFs, documents, or all attachments
@@ -70,6 +71,8 @@ mailgrep --dedupe
 | `--check-duplicates` | Analyze duplicate files |
 | `--dedupe` | Remove duplicates (keeps oldest) |
 | `--rebuild-hashes` | Recalculate file hashes |
+| `--logout` | Clear cached auth tokens |
+| `--reauth` | Force browser re-authentication |
 | `-v, --verbose` | Detailed output |
 | `-q, --quiet` | Minimal output |
 
