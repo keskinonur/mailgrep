@@ -714,6 +714,17 @@ async function getAttachment(messageId: string, attachmentId: string, accessToke
 // Checks if attachment matches allowed file types from FILE_TYPES env var
 // If ALLOWED_EXTENSIONS is null (FILE_TYPES=*), all files are allowed
 
+// Map content types to extensions for inline image detection
+const CONTENT_TYPE_MAP: Record<string, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/gif": ".gif",
+  "image/bmp": ".bmp",
+  "image/webp": ".webp",
+  "image/tiff": ".tiff",
+};
+
 function isAllowedFile(attachment: Attachment): boolean {
   // Allow all files if FILE_TYPES=*
   if (ALLOWED_EXTENSIONS === null) {
@@ -721,7 +732,21 @@ function isAllowedFile(attachment: Attachment): boolean {
   }
 
   const filename = attachment.name.toLowerCase();
-  return ALLOWED_EXTENSIONS.some((ext) => filename.endsWith(ext));
+
+  // Check by filename extension first
+  if (ALLOWED_EXTENSIONS.some((ext) => filename.endsWith(ext))) {
+    return true;
+  }
+
+  // Also check contentType for inline images (often have no extension in name)
+  // e.g., "image001" with contentType "image/png"
+  const contentType = attachment.contentType?.toLowerCase() || "";
+  const mappedExt = CONTENT_TYPE_MAP[contentType];
+  if (mappedExt && ALLOWED_EXTENSIONS.includes(mappedExt)) {
+    return true;
+  }
+
+  return false;
 }
 
 // ============================================
@@ -913,6 +938,9 @@ async function run(options: CLIOptions): Promise<void> {
     return str.slice(0, maxLen - 1) + "…";
   };
 
+  // Disable progress bar in verbose mode to avoid interference with debug logs
+  const useProgressBar = !options.verbose;
+
   const progressBar = new cliProgress.SingleBar(
     {
       format: `{spinner} ${chalk.cyan("{bar}")} {percentage}% | {value}/{total} emails | {images} new | {skipped} cached | {status}`,
@@ -922,12 +950,14 @@ async function run(options: CLIOptions): Promise<void> {
     cliProgress.Presets.shades_classic
   );
 
-  progressBar.start(emails.length, 0, {
-    images: 0,
-    skipped: 0,
-    spinner: chalk.cyan(spinnerFrames[0]),
-    status: chalk.dim("Starting...")
-  });
+  if (useProgressBar) {
+    progressBar.start(emails.length, 0, {
+      images: 0,
+      skipped: 0,
+      spinner: chalk.cyan(spinnerFrames[0]),
+      status: chalk.dim("Starting...")
+    });
+  }
 
   let totalImages = 0;
   let totalSkipped = 0;
@@ -938,7 +968,7 @@ async function run(options: CLIOptions): Promise<void> {
 
   // Handle Ctrl+C - save manifest before exit
   const cleanup = async () => {
-    progressBar.stop();
+    if (useProgressBar) progressBar.stop();
     console.log();
     console.log(chalk.yellow("\nInterrupted! Saving progress..."));
 
@@ -965,34 +995,42 @@ async function run(options: CLIOptions): Promise<void> {
     spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
     const statusText = truncate(subject, 30);
 
-    progressBar.update(i, {
-      images: totalImages,
-      skipped: totalSkipped,
-      spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
-      status: statusText
-    });
+    if (useProgressBar) {
+      progressBar.update(i, {
+        images: totalImages,
+        skipped: totalSkipped,
+        spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
+        status: statusText
+      });
+    }
 
-    logger.debug(`Processing: ${dateStr} - ${subject}`);
+    logger.debug(`Processing: ${dateStr} - ${subject} (hasAttachments=${message.hasAttachments})`);
 
     // Skip already processed emails (no API call needed)
     if (processedEmailIds.has(message.id)) {
       totalSkippedEmails++;
-      progressBar.update(i + 1, { images: totalImages, skipped: totalSkipped });
+      logger.debug(`  Skipped (already processed)`);
+      if (useProgressBar) progressBar.update(i + 1, { images: totalImages, skipped: totalSkipped });
       continue;
     }
 
-    if (!message.hasAttachments) {
-      // Mark as processed even if no attachments
-      newProcessedEmailIds.push(message.id);
-      progressBar.update(i + 1, { images: totalImages, skipped: totalSkipped });
-      continue;
-    }
+    // Note: hasAttachments can be false for inline images (embedded via CID)
+    // We check all emails to catch inline images too, unless already processed
+    // This costs one extra API call per email but ensures we don't miss inline images
 
+    logger.debug(`  Fetching attachments...`);
     const attachmentsUrl = `https://graph.microsoft.com/v1.0/me/messages/${message.id}/attachments`;
     const attachmentsResponse: GraphResponse<Attachment> = await graphFetch<Attachment>(attachmentsUrl, accessToken);
 
+    logger.debug(`  Found ${attachmentsResponse.value.length} attachment(s)`);
+
     for (const attachment of attachmentsResponse.value) {
-      if (!isAllowedFile(attachment)) continue;
+      logger.debug(`    Attachment: "${attachment.name}" (${attachment.contentType}, inline=${attachment.isInline})`);
+
+      if (!isAllowedFile(attachment)) {
+        logger.debug(`    Skipped: not an allowed file type`);
+        continue;
+      }
 
       // Check if already downloaded
       const manifestKey = createManifestKey(message.id, attachment.id);
@@ -1004,11 +1042,13 @@ async function run(options: CLIOptions): Promise<void> {
 
       // Update spinner on each attachment
       spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
-      progressBar.update(i, {
-        spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
-        skipped: totalSkipped,
-        status: chalk.green(truncate(attachment.name, 25))
-      });
+      if (useProgressBar) {
+        progressBar.update(i, {
+          spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
+          skipped: totalSkipped,
+          status: chalk.green(truncate(attachment.name, 25))
+        });
+      }
 
       if (options.dryRun) {
         totalImages++;
@@ -1018,7 +1058,15 @@ async function run(options: CLIOptions): Promise<void> {
         const fullAttachment = await getAttachment(message.id, attachment.id, accessToken);
 
         if (fullAttachment.contentBytes) {
-          const safeName = attachment.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+          let safeName = attachment.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+          // Add extension for inline images that don't have one (e.g., "image001")
+          const hasExtension = /\.[a-zA-Z0-9]+$/.test(safeName);
+          if (!hasExtension && attachment.contentType) {
+            const ext = CONTENT_TYPE_MAP[attachment.contentType.toLowerCase()];
+            if (ext) safeName += ext;
+          }
+
           const imageIndex = userSenderManifest.entries.length + newEntries.length + 1;
           const filename = `${dateStr}_${imageIndex}_${safeName}`;
           const filepath = join(config.outputDir, filename);
@@ -1054,15 +1102,19 @@ async function run(options: CLIOptions): Promise<void> {
     // Mark email as fully processed
     newProcessedEmailIds.push(message.id);
 
-    progressBar.update(i + 1, { images: totalImages, skipped: totalSkipped });
+    if (useProgressBar) progressBar.update(i + 1, { images: totalImages, skipped: totalSkipped });
   }
 
-  progressBar.update(emails.length, {
-    spinner: chalk.green("✓"),
-    skipped: totalSkipped,
-    status: chalk.green("Complete!")
-  });
-  progressBar.stop();
+  if (useProgressBar) {
+    progressBar.update(emails.length, {
+      spinner: chalk.green("✓"),
+      skipped: totalSkipped,
+      status: chalk.green("Complete!")
+    });
+    progressBar.stop();
+  } else {
+    logger.info(`Complete! ${totalImages} new, ${totalSkipped} cached`);
+  }
 
   // Remove signal handlers
   process.off("SIGINT", cleanup);
