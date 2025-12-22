@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.6";
+const VERSION = "1.0.7";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
@@ -429,6 +429,19 @@ function getUserEmailFromToken(accessToken: string): string {
   }
 }
 
+function getTenantIdFromToken(accessToken: string): string | null {
+  // Extract actual tenant ID from JWT 'tid' claim
+  // Important when AZURE_TENANT_ID is "organizations" (multi-tenant)
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(atob(parts[1]));
+    return payload.tid || null;
+  } catch {
+    return null;
+  }
+}
+
 // ============================================
 // Manifest Helpers
 // ============================================
@@ -566,8 +579,10 @@ async function saveTokenCache(cache: TokenCacheFile): Promise<void> {
 
 function getCachedTokensForTenant(cache: TokenCacheFile, tenantId: string): TokenCache[] {
   // Get all tokens for this tenant, sorted by most recently cached
+  // When tenantId is "organizations" (multi-tenant), return all cached tokens
+  const isMultiTenant = tenantId === "organizations";
   return cache.tokens
-    .filter(t => t.tenantId === tenantId)
+    .filter(t => isMultiTenant || t.tenantId === tenantId)
     .sort((a, b) => new Date(b.cachedAt).getTime() - new Date(a.cachedAt).getTime());
 }
 
@@ -1112,10 +1127,11 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
         if (refreshed) {
           accessToken = refreshed.accessToken;
           userEmail = getUserEmailFromToken(accessToken);
+          const actualTenantId = getTenantIdFromToken(accessToken) || OAUTH_CONFIG.tenantId;
 
-          // Update cache with new tokens
+          // Update cache with new tokens (use actual tenant ID from token)
           setCachedToken(tokenCache, {
-            tenantId: OAUTH_CONFIG.tenantId,
+            tenantId: actualTenantId,
             accessToken: refreshed.accessToken,
             refreshToken: refreshed.refreshToken,
             expiresAt: refreshed.expiresAt,
@@ -1149,11 +1165,12 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
       const authResult = await authenticate(authSpinner);
       accessToken = authResult.accessToken;
       userEmail = getUserEmailFromToken(accessToken);
+      const actualTenantId = getTenantIdFromToken(accessToken) || OAUTH_CONFIG.tenantId;
 
-      // Save tokens to cache
+      // Save tokens to cache (use actual tenant ID from token)
       const tokenCache = await loadTokenCache();
       setCachedToken(tokenCache, {
-        tenantId: OAUTH_CONFIG.tenantId,
+        tenantId: actualTenantId,
         accessToken: authResult.accessToken,
         refreshToken: authResult.refreshToken,
         expiresAt: authResult.expiresAt,
