@@ -102,6 +102,48 @@ FILE_TYPES=pdf,docx,xlsx          # Documents only
 FILE_TYPES=*                      # All attachments
 ```
 
+### Multi-Tenant vs Single-Tenant
+
+| Setting | Use Case |
+|---------|----------|
+| `AZURE_TENANT_ID=your-tenant-id` | Single organization (recommended) |
+| `AZURE_TENANT_ID=organizations` | Any Azure AD account (multi-tenant) |
+| Omit `AZURE_TENANT_ID` | Defaults to `organizations` |
+
+Multi-tenant mode allows logging in with any work account but requires the Azure app to be configured for multi-tenant.
+
+### Multiple Accounts
+
+When multiple accounts are cached, mailgrep prompts you to select:
+
+```
+Multiple cached accounts found:
+  1. user1@company.com
+  2. user2@company.com
+  3. Login as different user
+
+Select account (number):
+```
+
+Or skip the prompt with `--user`:
+
+```bash
+mailgrep --user user1@company.com -e sender@example.com
+```
+
+### Cache Locations
+
+| Cache | Location | Purpose |
+|-------|----------|---------|
+| Auth tokens | `~/.mailgrep/tokens.json` | OAuth access/refresh tokens |
+| Download manifest | `<output-dir>/manifest.json` | Tracks downloaded files |
+
+Use `--output` to change the download directory (and manifest location):
+
+```bash
+mailgrep -o ~/backups/mail --show-accounts
+```
+
 ## Azure AD Setup
 
 1. Go to [Azure Portal](https://portal.azure.com) → **App registrations** → **New registration**

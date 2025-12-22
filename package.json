@@ -1,6 +1,6 @@
 {
   "name": "mailgrep",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Download email attachments from Office 365 with incremental backup",
   "author": "Onur Keskin",
   "license": "MIT",

@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.7";
+const VERSION = "1.0.8";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
@@ -543,7 +543,7 @@ function findDuplicates(entries: ManifestEntry[]): DuplicateGroup[] {
 
 const TOKEN_CACHE_DIR = join(homedir(), ".mailgrep");
 const TOKEN_CACHE_PATH = join(TOKEN_CACHE_DIR, "tokens.json");
-const TOKEN_CACHE_VERSION = 2;  // v2: keyed by userEmail, normalized casing
+const TOKEN_CACHE_VERSION = 3;  // v3: actual tid from token, not "organizations"
 
 async function loadTokenCache(): Promise<TokenCacheFile> {
   try {
@@ -569,6 +569,21 @@ function migrateTokenCache(cache: TokenCacheFile): TokenCacheFile {
       }));
     cache.version = 2;
   }
+
+  // Migration v2 to v3: replace "organizations" tenantId with actual tid from token
+  if (cache.version < 3) {
+    cache.tokens = cache.tokens.map(t => {
+      if (t.tenantId === "organizations" && t.accessToken) {
+        const actualTid = getTenantIdFromToken(t.accessToken);
+        if (actualTid) {
+          return { ...t, tenantId: actualTid };
+        }
+      }
+      return t;
+    });
+    cache.version = 3;
+  }
+
   return cache;
 }
 
@@ -942,15 +957,22 @@ function isValidDate(dateStr: string): boolean {
          date.getUTCDate() === day;
 }
 
+class DateValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DateValidationError";
+  }
+}
+
 function validateDates(startDate: string, endDate: string): void {
   if (!isValidDate(startDate)) {
-    throw new Error(`Invalid start date: "${startDate}". Use YYYY-MM-DD format.`);
+    throw new DateValidationError(`Invalid start date: "${startDate}". Use YYYY-MM-DD format.`);
   }
   if (!isValidDate(endDate)) {
-    throw new Error(`Invalid end date: "${endDate}". Use YYYY-MM-DD format.`);
+    throw new DateValidationError(`Invalid end date: "${endDate}". Use YYYY-MM-DD format.`);
   }
   if (startDate > endDate) {
-    throw new Error(`Start date (${startDate}) cannot be after end date (${endDate}).`);
+    throw new DateValidationError(`Start date (${startDate}) cannot be after end date (${endDate}).`);
   }
 }
 
@@ -1113,6 +1135,13 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
 
     const cachedToken = getCachedToken(tokenCache, OAUTH_CONFIG.tenantId, selectedUser);
 
+    // Log hint when --user specified but not found in cache
+    if (!cachedToken && options.user) {
+      authSpinner.info(`No cached token for user "${options.user}" in tenant "${OAUTH_CONFIG.tenantId}"`);
+      authSpinner.start("Opening browser for login...");
+      throw new Error("user_not_in_cache");
+    }
+
     if (cachedToken) {
       if (!isTokenExpired(cachedToken)) {
         // Use cached token directly
@@ -1155,7 +1184,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     }
   } catch (error) {
     // Fall back to browser authentication
-    if (error instanceof Error && !["refresh_failed", "no_refresh_token", "no_cached_token", "force_reauth", "user_selected_new_login"].includes(error.message)) {
+    if (error instanceof Error && !["refresh_failed", "no_refresh_token", "no_cached_token", "force_reauth", "user_selected_new_login", "user_not_in_cache"].includes(error.message)) {
       // Real error, re-throw
       authSpinner.fail("Authentication failed");
       throw error;
@@ -1609,6 +1638,8 @@ program
       console.log();
       console.log(chalk.bold("Cached Accounts"));
       console.log(chalk.dim("─".repeat(50)));
+      console.log(chalk.dim(`  Manifest: ${manifestPath}`));
+      console.log();
 
       if (manifest.accounts.length === 0) {
         console.log(chalk.dim("  No cached accounts found."));
@@ -1634,6 +1665,7 @@ program
       console.log();
       console.log(chalk.bold("Duplicate Analysis"));
       console.log(chalk.dim("─".repeat(50)));
+      console.log(chalk.dim(`  Manifest: ${manifestPath}`));
 
       let totalDuplicates = 0;
       let totalWastedBytes = 0;
@@ -1682,6 +1714,8 @@ program
       console.log();
       console.log(chalk.bold("Rebuilding Hashes"));
       console.log(chalk.dim("─".repeat(50)));
+      console.log(chalk.dim(`  Manifest: ${manifestPath}`));
+      console.log();
 
       let updated = 0;
       let missing = 0;
@@ -1731,6 +1765,7 @@ program
       console.log();
       console.log(chalk.bold("Deduplicating Files"));
       console.log(chalk.dim("─".repeat(50)));
+      console.log(chalk.dim(`  Manifest: ${manifestPath}`));
 
       let totalDeleted = 0;
       let totalFreed = 0;
@@ -1800,6 +1835,11 @@ program
       await run(options, options.reauth);
       process.exit(ExitCode.Success);
     } catch (error) {
+      if (error instanceof DateValidationError) {
+        // Friendly error for date validation (no stack trace needed)
+        console.error(chalk.red(`\nError: ${error.message}`));
+        process.exit(ExitCode.ConfigError);
+      }
       if (error instanceof Error) {
         console.error(chalk.red(`\nError: ${error.message}`));
         if (options.verbose) {
