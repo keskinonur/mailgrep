@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
@@ -549,11 +549,17 @@ async function saveTokenCache(cache: TokenCacheFile): Promise<void> {
 }
 
 function getCachedToken(cache: TokenCacheFile, tenantId: string): TokenCache | undefined {
-  return cache.tokens.find(t => t.tenantId === tenantId);
+  // Find all tokens for this tenant, return most recently cached one
+  // This supports multiple users per tenant without collision
+  const tenantTokens = cache.tokens
+    .filter(t => t.tenantId === tenantId)
+    .sort((a, b) => new Date(b.cachedAt).getTime() - new Date(a.cachedAt).getTime());
+  return tenantTokens[0];
 }
 
 function setCachedToken(cache: TokenCacheFile, token: TokenCache): void {
-  const index = cache.tokens.findIndex(t => t.tenantId === token.tenantId);
+  // Key by userEmail to support multiple users per tenant
+  const index = cache.tokens.findIndex(t => t.userEmail.toLowerCase() === token.userEmail.toLowerCase());
   if (index >= 0) {
     cache.tokens[index] = token;
   } else {
@@ -875,16 +881,49 @@ function isAllowedFile(attachment: Attachment): boolean {
 // ============================================
 // Configuration
 // ============================================
+function isValidDate(dateStr: string): boolean {
+  // Check format YYYY-MM-DD
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return false;
+  }
+  // Check if date is actually valid (e.g., not 2025-02-30)
+  const date = new Date(dateStr + "T00:00:00Z");
+  if (isNaN(date.getTime())) {
+    return false;
+  }
+  // Verify the parsed date matches input (catches invalid dates like 02-30)
+  const [year, month, day] = dateStr.split("-").map(Number);
+  return date.getUTCFullYear() === year &&
+         date.getUTCMonth() + 1 === month &&
+         date.getUTCDate() === day;
+}
+
+function validateDates(startDate: string, endDate: string): void {
+  if (!isValidDate(startDate)) {
+    throw new Error(`Invalid start date: "${startDate}". Use YYYY-MM-DD format.`);
+  }
+  if (!isValidDate(endDate)) {
+    throw new Error(`Invalid end date: "${endDate}". Use YYYY-MM-DD format.`);
+  }
+  if (startDate > endDate) {
+    throw new Error(`Start date (${startDate}) cannot be after end date (${endDate}).`);
+  }
+}
+
 async function getConfig(options: CLIOptions): Promise<Config> {
   const defaults = getDefaultDates();
   const defaultOutputDir = DEFAULT_OUTPUT || join(process.cwd(), "downloads");
 
   // Non-interactive mode if all options provided
   if (options.email) {
+    const startDate = options.start || defaults.startDate;
+    const endDate = options.end || defaults.endDate;
+    validateDates(startDate, endDate);
+
     return {
       senderEmail: options.email,
-      startDate: options.start || defaults.startDate,
-      endDate: options.end || defaults.endDate,
+      startDate,
+      endDate,
       outputDir: expandPath(options.output || defaultOutputDir),
     };
   }
@@ -912,6 +951,9 @@ async function getConfig(options: CLIOptions): Promise<Config> {
 
     rl.close();
 
+    // Validate dates before proceeding
+    validateDates(startDate, endDate);
+
     return {
       senderEmail,
       startDate,
@@ -932,6 +974,11 @@ function expandPath(path: string): string {
     return join(process.cwd(), path);
   }
   return path;
+}
+
+function getOutputDir(options: CLIOptions): string {
+  const defaultOutputDir = DEFAULT_OUTPUT || join(process.cwd(), "downloads");
+  return expandPath(options.output || defaultOutputDir);
 }
 
 // ============================================
@@ -1475,7 +1522,8 @@ program
 
     // Handle --show-accounts
     if (options.showAccounts) {
-      const manifestPath = join(process.cwd(), "downloads", "manifest.json");
+      const outputDir = getOutputDir(options);
+      const manifestPath = join(outputDir, "manifest.json");
       const manifest = await loadManifest(manifestPath);
 
       console.log();
@@ -1499,7 +1547,8 @@ program
 
     // Handle --check-duplicates
     if (options.checkDuplicates) {
-      const manifestPath = join(process.cwd(), "downloads", "manifest.json");
+      const outputDir = getOutputDir(options);
+      const manifestPath = join(outputDir, "manifest.json");
       const manifest = await loadManifest(manifestPath);
 
       console.log();
@@ -1546,8 +1595,8 @@ program
 
     // Handle --rebuild-hashes
     if (options.rebuildHashes) {
-      const manifestPath = join(process.cwd(), "downloads", "manifest.json");
-      const downloadsDir = join(process.cwd(), "downloads");
+      const outputDir = getOutputDir(options);
+      const manifestPath = join(outputDir, "manifest.json");
       const manifest = await loadManifest(manifestPath);
 
       console.log();
@@ -1563,7 +1612,7 @@ program
           total++;
           if (entry.hash) continue;  // Already has hash
 
-          const filepath = join(downloadsDir, entry.filename);
+          const filepath = join(outputDir, entry.filename);
           const file = Bun.file(filepath);
 
           if (await file.exists()) {
@@ -1595,8 +1644,8 @@ program
 
     // Handle --dedupe
     if (options.dedupe) {
-      const manifestPath = join(process.cwd(), "downloads", "manifest.json");
-      const downloadsDir = join(process.cwd(), "downloads");
+      const outputDir = getOutputDir(options);
+      const manifestPath = join(outputDir, "manifest.json");
       const manifest = await loadManifest(manifestPath);
 
       console.log();
@@ -1624,7 +1673,7 @@ program
           console.log(`\n    ${chalk.dim("Keeping:")} ${keep.filename}`);
 
           for (const entry of toDelete) {
-            const filepath = join(downloadsDir, entry.filename);
+            const filepath = join(outputDir, entry.filename);
             const file = Bun.file(filepath);
 
             if (await file.exists()) {
