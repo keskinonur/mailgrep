@@ -41,7 +41,7 @@ import cliProgress from "cli-progress";
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.5";
+const VERSION = "1.0.6";
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
 
@@ -584,9 +584,11 @@ function getCachedToken(cache: TokenCacheFile, tenantId: string, userEmail?: str
 }
 
 function setCachedToken(cache: TokenCacheFile, token: TokenCache): void {
-  // Key by userEmail (normalized) to support multiple users per tenant
+  // Key by (tenantId, userEmail) to avoid cross-tenant clobbering
   const normalizedEmail = token.userEmail.toLowerCase();
-  const index = cache.tokens.findIndex(t => t.userEmail.toLowerCase() === normalizedEmail);
+  const index = cache.tokens.findIndex(
+    t => t.tenantId === token.tenantId && t.userEmail.toLowerCase() === normalizedEmail
+  );
   if (index >= 0) {
     cache.tokens[index] = { ...token, userEmail: normalizedEmail };
   } else {
