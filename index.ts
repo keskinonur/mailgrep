@@ -103,10 +103,10 @@ function showBanner(): void {
   const banner = `
   ${dim("    ╭────────────────────────────────────────╮")}
   ${dim("    │")}                                        ${dim("│")}
-  ${dim("    │")}    ${cyan("✦")} ${title}  ${dim("v" + VERSION)}                 ${dim("│")}
+  ${dim("    │")}    ${cyan("✦")} ${title}  ${dim("v" + VERSION)}                  ${dim("│")}
   ${dim("    │")}                                        ${dim("│")}
-  ${dim("    │")}    ${gray("Like grep, but for your inbox.")}     ${dim("│")}
-  ${dim("    │")}    ${gray("Download attachments from O365.")}    ${dim("│")}
+  ${dim("    │")}    ${gray("Like grep, but for your inbox.")}      ${dim("│")}
+  ${dim("    │")}    ${gray("Download attachments from O365.")}     ${dim("│")}
   ${dim("    │")}                                        ${dim("│")}
   ${dim("    ╰────────────────────────────────────────╯")}
 `;
@@ -1591,21 +1591,23 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     cliProgress.Presets.shades_classic
   );
   
-  // Handle terminal resize
+  // Handle terminal resize - track current status for redraw
+  let currentStatus = "";
   const handleResize = () => {
     if (useProgressBar) {
       // Force redraw on resize
-      progressBar.update({ status: progressBar.getPayload?.()?.status || "" });
+      progressBar.update({ status: currentStatus });
     }
   };
   process.stdout.on("resize", handleResize);
 
   if (useProgressBar) {
+    currentStatus = chalk.dim("Starting...");
     progressBar.start(emails.length, 0, {
       images: 0,
       skipped: 0,
       spinner: chalk.cyan(spinnerFrames[0]),
-      status: chalk.dim("Starting...")
+      status: currentStatus
     });
   }
 
@@ -1723,11 +1725,12 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     const statusText = truncate(subject, 30);
 
     if (useProgressBar) {
+      currentStatus = statusText;
       progressBar.update(i, {
         images: totalImages,
         skipped: totalSkipped,
         spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
-        status: statusText
+        status: currentStatus
       });
     }
 
@@ -1792,10 +1795,11 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
         // Update status with current attachment
         if (useProgressBar && chunk.length > 0) {
           spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
+          currentStatus = chalk.green(truncate(chunk[0].attachment.name, 25));
           progressBar.update(i, {
             spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
             skipped: totalSkipped,
-            status: chalk.green(truncate(chunk[0].attachment.name, 25))
+            status: currentStatus
           });
         }
 
@@ -1825,10 +1829,11 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   }
 
   if (useProgressBar) {
+    currentStatus = chalk.green("Complete!");
     progressBar.update(emails.length, {
       spinner: chalk.green("✓"),
       skipped: totalSkipped,
-      status: chalk.green("Complete!")
+      status: currentStatus
     });
     progressBar.stop();
   } else if (!options.json) {
