@@ -11,7 +11,7 @@
  * - Graceful Ctrl+C handling (saves progress before exit)
  *
  * Setup:
- *   1. Create Azure AD app at https://portal.azure.com → App registrations
+ *   1. Create Azure AD app at https://portal.azure.com -> App registrations
  *   2. Set redirect URI to "http://localhost:8400" (Mobile/Desktop platform)
  *   3. Enable "Allow public client flows"
  *   4. Create .env with AZURE_CLIENT_ID and AZURE_TENANT_ID
@@ -30,20 +30,29 @@
  * Repository: https://github.com/keskinonur/mailgrep
  */
 
-import { join } from "path";
+import { join, resolve, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import * as readline from "readline";
 import { Command } from "commander";
 import chalk from "chalk";
 import ora, { type Ora } from "ora";
 import cliProgress from "cli-progress";
+import packageJson from "./package.json" with { type: "json" };
 
 // ============================================
 // Constants
 // ============================================
-const VERSION = "1.0.8";
+const VERSION = packageJson.version;
 const OAUTH_PORT = 8400;              // Local server port for OAuth redirect
 const PAGE_SIZE = 50;                 // Emails per Graph API page (max 50)
+
+// Magic numbers extracted as constants
+const API_TIMEOUT_MS = 30000;
+const DEFAULT_RETRY_DELAY_SEC = 5;
+const TOKEN_EXPIRY_BUFFER_MS = 60000;
+const MAX_RETRY_ATTEMPTS = 5;
+const MAX_FILENAME_LENGTH = 200;
+const AUTH_TIMEOUT_MS = 5 * 60 * 1000;  // 5 minutes for OAuth browser flow
 
 // Defaults from environment (optional - prompts if not set)
 const DEFAULT_SENDER = process.env.DEFAULT_SENDER || "";
@@ -139,6 +148,7 @@ interface CLIOptions {
   end?: string;
   output?: string;
   user?: string;  // --user to select cached account
+  since?: string;  // --since for incremental sync
   dryRun: boolean;
   verbose: boolean;
   quiet: boolean;
@@ -149,6 +159,22 @@ interface CLIOptions {
   dedupe: boolean;
   logout: boolean;
   reauth: boolean;
+  stats: boolean;  // --stats for quick count without download
+  json: boolean;   // --json for JSON output mode
+}
+
+// Result summary for --json output
+interface RunSummary {
+  account: string;
+  sender: string;
+  emailsProcessed: number;
+  emailsSkipped: number;
+  filesDownloaded: number;
+  filesSkipped: number;
+  totalSize: number;
+  duplicates: number;
+  duration: number;
+  outputDir: string;
 }
 
 // ============================================
@@ -183,6 +209,19 @@ interface Manifest {
   accounts: UserSenderManifest[];  // Supports multiple user+sender combos
 }
 
+/**
+ * Validates that an object conforms to the Manifest schema
+ */
+function isValidManifest(obj: unknown): obj is Manifest {
+  if (typeof obj !== "object" || obj === null) return false;
+  const manifest = obj as Record<string, unknown>;
+  return (
+    typeof manifest.version === "number" &&
+    typeof manifest.updatedAt === "string" &&
+    Array.isArray(manifest.accounts)
+  );
+}
+
 // ============================================
 // Token Cache Types - Persistent Authentication
 // ============================================
@@ -208,7 +247,7 @@ interface TokenCacheFile {
 // ============================================
 // Uses OAuth2 Authorization Code flow with PKCE (Proof Key for Code Exchange)
 // PKCE allows public clients (like CLI tools) to authenticate without a client secret
-// Flow: Browser login → redirect to localhost → exchange code for token
+// Flow: Browser login -> redirect to localhost -> exchange code for token
 const OAUTH_CONFIG = {
   clientId: process.env.AZURE_CLIENT_ID || "",
   tenantId: process.env.AZURE_TENANT_ID || "organizations",  // "organizations" = any Azure AD tenant
@@ -221,6 +260,48 @@ const OAUTH_CONFIG = {
     return `https://login.microsoftonline.com/${this.tenantId}/oauth2/v2.0/token`;
   },
 };
+
+// ============================================
+// Security Helpers
+// ============================================
+
+/**
+ * Escapes HTML special characters to prevent XSS attacks
+ */
+function escapeHtml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+/**
+ * Validates email format
+ */
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length < 254;
+}
+
+/**
+ * Sanitizes filename to prevent path traversal attacks
+ */
+function sanitizeFilename(filename: string): string {
+  return filename
+    .replace(/[^a-zA-Z0-9._-]/g, "_")  // Replace unsafe chars
+    .replace(/\.{2,}/g, ".")            // Collapse multiple dots
+    .substring(0, MAX_FILENAME_LENGTH); // Limit length
+}
+
+/**
+ * Validates that a filepath doesn't escape the output directory
+ */
+function isPathSafe(outputDir: string, filepath: string): boolean {
+  const resolvedOutput = resolve(outputDir);
+  const resolvedFile = resolve(filepath);
+  return resolvedFile.startsWith(resolvedOutput + sep) || resolvedFile === resolvedOutput;
+}
 
 // ============================================
 // Logger
@@ -305,17 +386,6 @@ function getDefaultDates(): { startDate: string; endDate: string } {
   };
 }
 
-function getTimestampFolder(): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  const hours = String(now.getHours()).padStart(2, "0");
-  const minutes = String(now.getMinutes()).padStart(2, "0");
-  const seconds = String(now.getSeconds()).padStart(2, "0");
-  return `${year}${month}${day}_${hours}${minutes}${seconds}`;
-}
-
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -357,7 +427,7 @@ async function openBrowser(url: string): Promise<void> {
     if (platform === "darwin") {
       await Bun.$`open ${url}`.quiet();
     } else if (platform === "win32") {
-      await Bun.$`cmd /c start ${url}`.quiet();
+      await Bun.$`cmd /c start "" "${url}"`.quiet();
     } else {
       // Linux and others
       await Bun.$`xdg-open ${url}`.quiet();
@@ -423,7 +493,14 @@ function getUserEmailFromToken(accessToken: string): string {
     // Decode payload (middle part) - no signature validation needed
     // Token is already validated by Microsoft when we received it
     const payload = JSON.parse(atob(parts[1]));
-    return payload.preferred_username || payload.upn || payload.email || "unknown";
+    const email = payload.preferred_username || payload.upn || payload.email || "unknown";
+    
+    // Validate email format before returning
+    if (email !== "unknown" && !isValidEmail(email)) {
+      return "unknown";
+    }
+    
+    return email;
   } catch {
     return "unknown";
   }
@@ -452,7 +529,10 @@ async function loadManifest(path: string): Promise<Manifest> {
     const file = Bun.file(path);
     if (await file.exists()) {
       const content = await file.json();
-      return content as Manifest;
+      if (isValidManifest(content)) {
+        return content;
+      }
+      logger?.warn("Invalid manifest format, starting fresh");
     }
   } catch (error) {
     logger?.warn(`Could not load manifest, starting fresh: ${error}`);
@@ -466,6 +546,18 @@ async function loadManifest(path: string): Promise<Manifest> {
 }
 
 async function saveManifest(path: string, manifest: Manifest): Promise<void> {
+  // Backup existing manifest before overwriting
+  const file = Bun.file(path);
+  if (await file.exists()) {
+    const backupPath = path + ".bak";
+    try {
+      await Bun.write(backupPath, await file.text());
+    } catch (backupError) {
+      logger?.warn(`Could not create manifest backup: ${backupError}`);
+      // Continue anyway - backup is optional
+    }
+  }
+  
   manifest.updatedAt = new Date().toISOString();
   await Bun.write(path, JSON.stringify(manifest, null, 2));
 }
@@ -590,6 +682,11 @@ function migrateTokenCache(cache: TokenCacheFile): TokenCacheFile {
 async function saveTokenCache(cache: TokenCacheFile): Promise<void> {
   await Bun.$`mkdir -p ${TOKEN_CACHE_DIR}`.quiet();
   await Bun.write(TOKEN_CACHE_PATH, JSON.stringify(cache, null, 2));
+  
+  // Set restrictive permissions on token cache (Unix only)
+  if (process.platform !== "win32") {
+    await Bun.$`chmod 600 ${TOKEN_CACHE_PATH}`.quiet();
+  }
 }
 
 function getCachedTokensForTenant(cache: TokenCacheFile, tenantId: string): TokenCache[] {
@@ -627,8 +724,8 @@ function setCachedToken(cache: TokenCacheFile, token: TokenCache): void {
 }
 
 function isTokenExpired(token: TokenCache): boolean {
-  // Add 60 second buffer to avoid edge cases
-  return Date.now() >= (token.expiresAt - 60000);
+  // Add buffer to avoid edge cases
+  return Date.now() >= (token.expiresAt - TOKEN_EXPIRY_BUFFER_MS);
 }
 
 function getTokenExpiry(accessToken: string): number {
@@ -644,6 +741,9 @@ function getTokenExpiry(accessToken: string): number {
 }
 
 async function refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; expiresAt: number } | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
   try {
     const response = await fetch(OAUTH_CONFIG.tokenUrl, {
       method: "POST",
@@ -654,7 +754,10 @@ async function refreshAccessToken(refreshToken: string): Promise<{ accessToken: 
         refresh_token: refreshToken,
         scope: OAUTH_CONFIG.scopes.join(" "),
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     const data = await response.json() as {
       access_token?: string;
@@ -668,10 +771,11 @@ async function refreshAccessToken(refreshToken: string): Promise<{ accessToken: 
 
     return {
       accessToken: data.access_token,
-      refreshToken: data.refresh_token || refreshToken, // May return new refresh token
+      refreshToken: data.refresh_token || refreshToken,
       expiresAt: getTokenExpiry(data.access_token),
     };
   } catch {
+    clearTimeout(timeout);
     return null;
   }
 }
@@ -704,95 +808,132 @@ async function authenticate(spinner: Ora): Promise<AuthResult> {
 
     spinner.text = "Opening browser for login...";
 
-    const server = Bun.serve({
-      port: OAUTH_PORT,
-      async fetch(req) {
-        const url = new URL(req.url);
+    // Track if auth completed to prevent timeout firing after success
+    let authCompleted = false;
 
-        if (url.pathname === "/") {
-          const code = url.searchParams.get("code");
-          const returnedState = url.searchParams.get("state");
-          const error = url.searchParams.get("error");
-          const errorDescription = url.searchParams.get("error_description");
+    let server: ReturnType<typeof Bun.serve>;
+    try {
+      server = Bun.serve({
+        port: OAUTH_PORT,
+        async fetch(req) {
+          const url = new URL(req.url);
 
-          if (error) {
-            setTimeout(() => {
-              server.stop();
-              reject(new Error(`OAuth error: ${errorDescription}`));
-            }, 100);
-            return new Response(errorPage(errorDescription || error), {
-              headers: { "Content-Type": "text/html; charset=utf-8" },
-            });
-          }
+          if (url.pathname === "/") {
+            const code = url.searchParams.get("code");
+            const returnedState = url.searchParams.get("state");
+            const error = url.searchParams.get("error");
+            const errorDescription = url.searchParams.get("error_description");
 
-          if (!code || returnedState !== state) {
-            setTimeout(() => {
-              server.stop();
-              reject(new Error("Invalid OAuth response - state mismatch"));
-            }, 100);
-            return new Response(errorPage("Invalid response"), {
-              headers: { "Content-Type": "text/html; charset=utf-8" },
-            });
-          }
-
-          try {
-            spinner.text = "Exchanging token...";
-
-            const tokenResponse = await fetch(OAUTH_CONFIG.tokenUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: new URLSearchParams({
-                client_id: OAUTH_CONFIG.clientId,
-                grant_type: "authorization_code",
-                code: code,
-                redirect_uri: OAUTH_CONFIG.redirectUri,
-                code_verifier: codeVerifier,
-              }),
-            });
-
-            const tokenData = (await tokenResponse.json()) as {
-              access_token?: string;
-              refresh_token?: string;
-              error?: string;
-              error_description?: string;
-            };
-
-            if (tokenData.error || !tokenData.access_token) {
+            if (error) {
               setTimeout(() => {
+                authCompleted = true;
+                clearTimeout(authTimeoutId);
                 server.stop();
-                reject(new Error(`Token error: ${tokenData.error_description}`));
+                reject(new Error(`OAuth error: ${errorDescription}`));
               }, 100);
-              return new Response(errorPage(tokenData.error_description || "Token error"), {
+              return new Response(errorPage(errorDescription || error), {
                 headers: { "Content-Type": "text/html; charset=utf-8" },
               });
             }
 
-            setTimeout(() => {
-              server.stop();
-              resolve({
-                accessToken: tokenData.access_token!,
-                refreshToken: tokenData.refresh_token || "",
-                expiresAt: getTokenExpiry(tokenData.access_token!),
+            if (!code || returnedState !== state) {
+              setTimeout(() => {
+                authCompleted = true;
+                clearTimeout(authTimeoutId);
+                server.stop();
+                reject(new Error("Invalid OAuth response - state mismatch"));
+              }, 100);
+              return new Response(errorPage("Invalid response"), {
+                headers: { "Content-Type": "text/html; charset=utf-8" },
               });
-            }, 100);
+            }
 
-            return new Response(successPage(), {
-              headers: { "Content-Type": "text/html; charset=utf-8" },
-            });
-          } catch (err) {
-            setTimeout(() => {
-              server.stop();
-              reject(err);
-            }, 100);
-            return new Response(errorPage("Authentication failed"), {
-              headers: { "Content-Type": "text/html; charset=utf-8" },
-            });
+            try {
+              spinner.text = "Exchanging token...";
+
+              const tokenController = new AbortController();
+              const tokenTimeout = setTimeout(() => tokenController.abort(), API_TIMEOUT_MS);
+
+              const tokenResponse = await fetch(OAUTH_CONFIG.tokenUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({
+                  client_id: OAUTH_CONFIG.clientId,
+                  grant_type: "authorization_code",
+                  code: code,
+                  redirect_uri: OAUTH_CONFIG.redirectUri,
+                  code_verifier: codeVerifier,
+                }),
+                signal: tokenController.signal,
+              });
+
+              clearTimeout(tokenTimeout);
+
+              const tokenData = (await tokenResponse.json()) as {
+                access_token?: string;
+                refresh_token?: string;
+                error?: string;
+                error_description?: string;
+              };
+
+              if (tokenData.error || !tokenData.access_token) {
+                setTimeout(() => {
+                  authCompleted = true;
+                  clearTimeout(authTimeoutId);
+                  server.stop();
+                  reject(new Error(`Token error: ${tokenData.error_description}`));
+                }, 100);
+                return new Response(errorPage(tokenData.error_description || "Token error"), {
+                  headers: { "Content-Type": "text/html; charset=utf-8" },
+                });
+              }
+
+              setTimeout(() => {
+                authCompleted = true;
+                clearTimeout(authTimeoutId);
+                server.stop();
+                resolve({
+                  accessToken: tokenData.access_token!,
+                  refreshToken: tokenData.refresh_token || "",
+                  expiresAt: getTokenExpiry(tokenData.access_token!),
+                });
+              }, 100);
+
+              return new Response(successPage(), {
+                headers: { "Content-Type": "text/html; charset=utf-8" },
+              });
+            } catch (err) {
+              setTimeout(() => {
+                authCompleted = true;
+                clearTimeout(authTimeoutId);
+                server.stop();
+                reject(err);
+              }, 100);
+              return new Response(errorPage("Authentication failed"), {
+                headers: { "Content-Type": "text/html; charset=utf-8" },
+              });
+            }
           }
-        }
 
-        return new Response("Not found", { status: 404 });
-      },
-    });
+          return new Response("Not found", { status: 404 });
+        },
+      });
+    } catch (err) {
+      if (err instanceof Error && (err.message.includes("EADDRINUSE") || err.message.includes("address already in use"))) {
+        reject(new Error(`Port ${OAUTH_PORT} is already in use. Is another mailgrep instance running?`));
+        return;
+      }
+      reject(err);
+      return;
+    }
+
+    // Set authentication timeout
+    const authTimeoutId = setTimeout(() => {
+      if (!authCompleted) {
+        server.stop();
+        reject(new Error("Authentication timed out after 5 minutes. Please try again."));
+      }
+    }, AUTH_TIMEOUT_MS);
 
     // Open browser (cross-platform)
     openBrowser(authUrl.toString()).catch(() => {
@@ -837,7 +978,7 @@ function errorPage(message: string): string {
 </head>
 <body>
   <h1>Authentication Failed</h1>
-  <p>${message}</p>
+  <p>${escapeHtml(message)}</p>
 </body>
 </html>`;
 }
@@ -848,9 +989,10 @@ function errorPage(message: string): string {
 // Microsoft Graph API is the unified endpoint for Microsoft 365 services
 // Docs: https://learn.microsoft.com/en-us/graph/api/overview
 
-async function graphFetch<T>(url: string, accessToken: string): Promise<GraphResponse<T>> {
+async function graphFetch<T>(url: string, accessToken: string, retryCount: number = 0): Promise<GraphResponse<T>> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);  // 30s timeout
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const startTime = Date.now();
 
   try {
     const response = await fetch(url, {
@@ -862,15 +1004,23 @@ async function graphFetch<T>(url: string, accessToken: string): Promise<GraphRes
     });
 
     clearTimeout(timeout);
+    
+    // Log response time in verbose mode
+    logger?.debug(`Graph API: ${response.status} (${Date.now() - startTime}ms)`);
 
     if (!response.ok) {
       // Handle rate limiting (429 Too Many Requests)
       // Graph API returns Retry-After header with seconds to wait
       if (response.status === 429) {
+        if (retryCount >= MAX_RETRY_ATTEMPTS) {
+          throw new Error(`Rate limit exceeded after ${MAX_RETRY_ATTEMPTS} retries`);
+        }
         const retryAfter = response.headers.get("Retry-After");
-        logger.warn(`Rate limited. Waiting ${retryAfter || 5}s...`);
-        await Bun.sleep((retryAfter ? parseInt(retryAfter) : 5) * 1000);
-        return graphFetch<T>(url, accessToken);  // Retry automatically
+        const baseDelay = retryAfter ? parseInt(retryAfter) : DEFAULT_RETRY_DELAY_SEC;
+        const waitSeconds = retryAfter ? baseDelay : baseDelay * Math.pow(2, retryCount);
+        logger.warn(`Rate limited. Waiting ${waitSeconds}s... (attempt ${retryCount + 1}/${MAX_RETRY_ATTEMPTS})`);
+        await Bun.sleep(waitSeconds * 1000);
+        return graphFetch<T>(url, accessToken, retryCount + 1);  // Retry with incremented count
       }
       const errorText = await response.text();
       throw new Error(`Graph API error: ${response.status} - ${errorText}`);
@@ -879,21 +1029,75 @@ async function graphFetch<T>(url: string, accessToken: string): Promise<GraphRes
     return response.json();
   } catch (error) {
     clearTimeout(timeout);
+    
+    // Retry on transient network failures (timeout/abort errors)
+    if (error instanceof Error && (error.name === "AbortError" || error.message.includes("fetch failed"))) {
+      if (retryCount < MAX_RETRY_ATTEMPTS) {
+        const waitSeconds = DEFAULT_RETRY_DELAY_SEC * Math.pow(2, retryCount);
+        logger?.warn(`Network error. Retrying in ${waitSeconds}s... (attempt ${retryCount + 1}/${MAX_RETRY_ATTEMPTS})`);
+        await Bun.sleep(waitSeconds * 1000);
+        return graphFetch<T>(url, accessToken, retryCount + 1);
+      }
+    }
+    
     throw error;
   }
 }
 
-async function getAttachment(messageId: string, attachmentId: string, accessToken: string): Promise<Attachment> {
+async function getAttachment(
+  messageId: string,
+  attachmentId: string,
+  accessToken: string,
+  retryCount: number = 0
+): Promise<Attachment> {
   const url = `https://graph.microsoft.com/v1.0/me/messages/${messageId}/attachments/${attachmentId}`;
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const startTime = Date.now();
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch attachment: ${response.status}`);
+  try {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+    
+    // Log response time in verbose mode
+    logger?.debug(`Attachment API: ${response.status} (${Date.now() - startTime}ms)`);
+
+    if (!response.ok) {
+      // Handle rate limiting (429 Too Many Requests)
+      if (response.status === 429) {
+        if (retryCount >= MAX_RETRY_ATTEMPTS) {
+          throw new Error(`Rate limit exceeded after ${MAX_RETRY_ATTEMPTS} retries`);
+        }
+        const retryAfter = response.headers.get("Retry-After");
+        const baseDelay = retryAfter ? parseInt(retryAfter) : DEFAULT_RETRY_DELAY_SEC;
+        const waitSeconds = retryAfter ? baseDelay : baseDelay * Math.pow(2, retryCount);
+        logger.warn(`Rate limited on attachment. Waiting ${waitSeconds}s... (attempt ${retryCount + 1}/${MAX_RETRY_ATTEMPTS})`);
+        await Bun.sleep(waitSeconds * 1000);
+        return getAttachment(messageId, attachmentId, accessToken, retryCount + 1);
+      }
+      throw new Error(`Failed to fetch attachment: ${response.status}`);
+    }
+
+    return response.json();
+  } catch (error) {
+    clearTimeout(timeout);
+    
+    // Retry on transient network failures (timeout/abort errors)
+    if (error instanceof Error && (error.name === "AbortError" || error.message.includes("fetch failed"))) {
+      if (retryCount < MAX_RETRY_ATTEMPTS) {
+        const waitSeconds = DEFAULT_RETRY_DELAY_SEC * Math.pow(2, retryCount);
+        logger?.warn(`Network error on attachment. Retrying in ${waitSeconds}s... (attempt ${retryCount + 1}/${MAX_RETRY_ATTEMPTS})`);
+        await Bun.sleep(waitSeconds * 1000);
+        return getAttachment(messageId, attachmentId, accessToken, retryCount + 1);
+      }
+    }
+    
+    throw error;
   }
-
-  return response.json();
 }
 
 // ============================================
@@ -982,16 +1186,35 @@ async function getConfig(options: CLIOptions): Promise<Config> {
 
   // Non-interactive mode if all options provided
   if (options.email) {
+    // Validate email format
+    if (!isValidEmail(options.email)) {
+      throw new Error(`Invalid email format: "${options.email}"`);
+    }
+    
     const startDate = options.start || defaults.startDate;
     const endDate = options.end || defaults.endDate;
     validateDates(startDate, endDate);
 
-    return {
+    const config: Config = {
       senderEmail: options.email,
       startDate,
       endDate,
       outputDir: expandPath(options.output || defaultOutputDir),
     };
+
+    // Handle --since option to override startDate
+    if (options.since) {
+      if (options.since === "last") {
+        // Will be handled after loading manifest, just mark it
+        config.startDate = "last";
+      } else if (isValidDate(options.since)) {
+        config.startDate = options.since;
+      } else {
+        throw new DateValidationError(`Invalid --since date: "${options.since}". Use YYYY-MM-DD or 'last'.`);
+      }
+    }
+
+    return config;
   }
 
   // Interactive mode
@@ -1010,6 +1233,11 @@ async function getConfig(options: CLIOptions): Promise<Config> {
     } else {
       senderEmail = await askRequired(rl, "Sender email");
     }
+    
+    // Validate email format
+    if (!isValidEmail(senderEmail)) {
+      throw new Error(`Invalid email format: "${senderEmail}"`);
+    }
 
     const startDate = await ask(rl, "Start date (YYYY-MM-DD)", defaults.startDate);
     const endDate = await ask(rl, "End date (YYYY-MM-DD)", defaults.endDate);
@@ -1020,26 +1248,40 @@ async function getConfig(options: CLIOptions): Promise<Config> {
     // Validate dates before proceeding
     validateDates(startDate, endDate);
 
-    return {
+    const config: Config = {
       senderEmail,
       startDate,
       endDate,
       outputDir: expandPath(outputDir),
     };
+
+    // Handle --since option to override startDate
+    if (options.since) {
+      if (options.since === "last") {
+        // Will be handled after loading manifest, just mark it
+        config.startDate = "last";
+      } else if (isValidDate(options.since)) {
+        config.startDate = options.since;
+      } else {
+        throw new DateValidationError(`Invalid --since date: "${options.since}". Use YYYY-MM-DD or 'last'.`);
+      }
+    }
+
+    return config;
   } catch (error) {
     rl.close();
     throw error;
   }
 }
 
-function expandPath(path: string): string {
-  if (path.startsWith("~")) {
-    return join(homedir(), path.slice(1));
+function expandPath(inputPath: string): string {
+  if (inputPath.startsWith("~")) {
+    return join(homedir(), inputPath.slice(1));
   }
-  if (!path.startsWith("/")) {
-    return join(process.cwd(), path);
+  if (!isAbsolute(inputPath)) {
+    return join(process.cwd(), inputPath);
   }
-  return path;
+  return inputPath;
 }
 
 function getOutputDir(options: CLIOptions): string {
@@ -1068,20 +1310,21 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
 
   const config = await getConfig(options);
 
-  console.log();
-  logger.dim(`Sender:     ${config.senderEmail}`);
-  logger.dim(`Date range: ${config.startDate} to ${config.endDate}`);
-  logger.dim(`Output:     ${config.outputDir}`);
-  logger.dim(`File types: ${ALLOWED_EXTENSIONS ? FILE_TYPES_RAW : "all (*)"}`);
-  logger.dim(`Started:    ${formatTime(startTime)}`);
-
-
-  if (options.dryRun) {
+  if (!options.json) {
     console.log();
-    console.log(chalk.yellow("DRY RUN MODE - No files will be downloaded"));
-  }
+    logger.dim(`Sender:     ${config.senderEmail}`);
+    logger.dim(`Date range: ${config.startDate} to ${config.endDate}`);
+    logger.dim(`Output:     ${config.outputDir}`);
+    logger.dim(`File types: ${ALLOWED_EXTENSIONS ? FILE_TYPES_RAW : "all (*)"}`);
+    logger.dim(`Started:    ${formatTime(startTime)}`);
 
-  console.log();
+    if (options.dryRun) {
+      console.log();
+      console.log(chalk.yellow("DRY RUN MODE - No files will be downloaded"));
+    }
+
+    console.log();
+  }
 
   // Create output directory
   if (!options.dryRun) {
@@ -1089,7 +1332,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   }
 
   // Authenticate - try cached token first, then refresh, then browser
-  const authSpinner = ora("Authenticating with Office 365...").start();
+  const authSpinner = options.json ? null : ora("Authenticating with Office 365...").start();
   let accessToken: string;
   let userEmail: string;
 
@@ -1105,9 +1348,9 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     const tenantTokens = getCachedTokensForTenant(tokenCache, OAUTH_CONFIG.tenantId);
     let selectedUser = options.user;
 
-    if (tenantTokens.length > 1 && !selectedUser) {
+    if (tenantTokens.length > 1 && !selectedUser && !options.json) {
       // Multiple accounts cached, prompt user to select
-      authSpinner.stop();
+      authSpinner?.stop();
       console.log();
       console.log(chalk.bold("Multiple cached accounts found:"));
       tenantTokens.forEach((t, i) => {
@@ -1123,22 +1366,29 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
       rl.close();
 
       const choice = parseInt(answer, 10);
+      if (isNaN(choice)) {
+        console.log(chalk.yellow("  Invalid input. Opening browser for new login..."));
+        throw new Error("user_selected_new_login");
+      }
       if (choice >= 1 && choice <= tenantTokens.length) {
         selectedUser = tenantTokens[choice - 1].userEmail;
+      } else if (choice === tenantTokens.length + 1) {
+        // User explicitly selected "Login as different user"
+        throw new Error("user_selected_new_login");
       } else {
-        // User wants to login as different user
+        console.log(chalk.yellow(`  Invalid choice (1-${tenantTokens.length + 1}). Opening browser for new login...`));
         throw new Error("user_selected_new_login");
       }
 
-      authSpinner.start("Authenticating with Office 365...");
+      authSpinner?.start("Authenticating with Office 365...");
     }
 
     const cachedToken = getCachedToken(tokenCache, OAUTH_CONFIG.tenantId, selectedUser);
 
     // Log hint when --user specified but not found in cache
     if (!cachedToken && options.user) {
-      authSpinner.info(`No cached token for user "${options.user}" in tenant "${OAUTH_CONFIG.tenantId}"`);
-      authSpinner.start("Opening browser for login...");
+      authSpinner?.info(`No cached token for user "${options.user}" in tenant "${OAUTH_CONFIG.tenantId}"`);
+      authSpinner?.start("Opening browser for login...");
       throw new Error("user_not_in_cache");
     }
 
@@ -1147,10 +1397,10 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
         // Use cached token directly
         accessToken = cachedToken.accessToken;
         userEmail = cachedToken.userEmail;
-        authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)} ${chalk.dim("(cached)")}`);
+        authSpinner?.succeed(`Authenticated as ${chalk.cyan(userEmail)} ${chalk.dim("(cached)")}`);
       } else if (cachedToken.refreshToken) {
         // Token expired, try refresh
-        authSpinner.text = "Refreshing authentication...";
+        if (authSpinner) authSpinner.text = "Refreshing authentication...";
         const refreshed = await refreshAccessToken(cachedToken.refreshToken);
 
         if (refreshed) {
@@ -1169,7 +1419,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
           });
           await saveTokenCache(tokenCache);
 
-          authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)} ${chalk.dim("(refreshed)")}`);
+          authSpinner?.succeed(`Authenticated as ${chalk.cyan(userEmail)} ${chalk.dim("(refreshed)")}`);
         } else {
           // Refresh failed, need browser auth
           throw new Error("refresh_failed");
@@ -1186,12 +1436,12 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     // Fall back to browser authentication
     if (error instanceof Error && !["refresh_failed", "no_refresh_token", "no_cached_token", "force_reauth", "user_selected_new_login", "user_not_in_cache"].includes(error.message)) {
       // Real error, re-throw
-      authSpinner.fail("Authentication failed");
+      authSpinner?.fail("Authentication failed");
       throw error;
     }
 
     try {
-      const authResult = await authenticate(authSpinner);
+      const authResult = await authenticate(authSpinner!);
       accessToken = authResult.accessToken;
       userEmail = getUserEmailFromToken(accessToken);
       const actualTenantId = getTenantIdFromToken(accessToken) || OAUTH_CONFIG.tenantId;
@@ -1208,9 +1458,9 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
       });
       await saveTokenCache(tokenCache);
 
-      authSpinner.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+      authSpinner?.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
     } catch (authError) {
-      authSpinner.fail("Authentication failed");
+      authSpinner?.fail("Authentication failed");
       throw authError;
     }
   }
@@ -1222,6 +1472,19 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   const downloadedKeys = !options.cache ? new Set<string>() : getDownloadedKeys(userSenderManifest);
   const processedEmailIds = !options.cache ? new Set<string>() : getProcessedEmailIds(userSenderManifest);
 
+  // Handle --since last
+  if (config.startDate === "last") {
+    if (userSenderManifest.lastSync) {
+      config.startDate = userSenderManifest.lastSync.slice(0, 10);
+      logger.dim(`Since last: ${config.startDate}`);
+    } else {
+      // No prior sync, fall back to default start date
+      const defaults = getDefaultDates();
+      config.startDate = defaults.startDate;
+      logger.warn(`No previous sync found. Using default start date: ${config.startDate}`);
+    }
+  }
+
   if (options.cache && (downloadedKeys.size > 0 || processedEmailIds.size > 0)) {
     logger.dim(`Cache:      ${downloadedKeys.size} files, ${processedEmailIds.size} emails processed`);
   }
@@ -1231,7 +1494,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
 
   // Fetch emails using Graph API with OData $filter
   // Using $filter with date range is more reliable than $search which has result limits
-  const fetchSpinner = ora("Fetching emails...").start();
+  const fetchSpinner = options.json ? null : ora("Fetching emails...").start();
 
   // Build OData filter: sender email + date range
   // Note: from/emailAddress/address filter may cause InefficientFilter on some tenants,
@@ -1259,13 +1522,13 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     }
 
     url = response["@odata.nextLink"];
-    fetchSpinner.text = `Fetching emails... (${emails.length} found)`;
+    if (fetchSpinner) fetchSpinner.text = `Fetching emails... (${emails.length} found)`;
   }
 
-  fetchSpinner.succeed(`Found ${emails.length} emails from ${config.senderEmail}`);
+  fetchSpinner?.succeed(`Found ${emails.length} emails from ${config.senderEmail}`);
 
   if (emails.length === 0) {
-    logger.info("No emails found matching criteria");
+    if (!options.json) logger.info("No emails found matching criteria");
     return;
   }
 
@@ -1282,23 +1545,47 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   let spinnerIndex = 0;
 
-  // Truncate text to fit terminal
+  // Get terminal width for dynamic sizing, with fallback
+  const getTerminalWidth = (): number => process.stdout.columns || 80;
+  
+  // Truncate text to fit terminal, dynamically sized
   const truncate = (str: string, maxLen: number): string => {
-    if (str.length <= maxLen) return str;
-    return str.slice(0, maxLen - 1) + "…";
+    const effectiveMax = Math.min(maxLen, Math.max(10, getTerminalWidth() - 80));
+    if (str.length <= effectiveMax) return str;
+    return str.slice(0, effectiveMax - 1) + "…";
   };
 
-  // Disable progress bar in verbose mode to avoid interference with debug logs
-  const useProgressBar = !options.verbose;
+  // Disable progress bar in verbose mode or JSON mode to avoid interference
+  const useProgressBar = !options.verbose && !options.json;
+
+  // Calculate dynamic bar size based on terminal width
+  const getBarSize = (): number => {
+    const width = getTerminalWidth();
+    if (width < 100) return 10;
+    if (width < 120) return 15;
+    return 20;
+  };
 
   const progressBar = new cliProgress.SingleBar(
     {
-      format: `{spinner} ${chalk.cyan("{bar}")} {percentage}% | {value}/{total} emails | {images} new | {skipped} cached | {status}`,
+      format: `{spinner} ${chalk.cyan("{bar}")} {percentage}% | {value}/{total} emails | {images} new | {skipped} cached | ETA: {eta_formatted} | {status}`,
       hideCursor: true,
-      barsize: 25,
+      barsize: getBarSize(),
+      etaBuffer: 10,
+      // Handle terminal resize by clearing line
+      forceRedraw: true,
     },
     cliProgress.Presets.shades_classic
   );
+  
+  // Handle terminal resize
+  const handleResize = () => {
+    if (useProgressBar) {
+      // Force redraw on resize
+      progressBar.update({ status: progressBar.getPayload?.()?.status || "" });
+    }
+  };
+  process.stdout.on("resize", handleResize);
 
   if (useProgressBar) {
     progressBar.start(emails.length, 0, {
@@ -1316,8 +1603,19 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   const newEntries: ManifestEntry[] = [];
   const newProcessedEmailIds: string[] = [];
 
+  // Track cleanup state to prevent double-cleanup
+  let cleanupInProgress = false;
+
   // Handle Ctrl+C - save manifest before exit
   const cleanup = async () => {
+    // Prevent double-cleanup
+    if (cleanupInProgress) return;
+    cleanupInProgress = true;
+
+    // Remove signal handlers first to prevent re-entry
+    process.off("SIGINT", cleanup);
+    process.off("SIGTERM", cleanup);
+
     if (useProgressBar) progressBar.stop();
     console.log();
     console.log(chalk.yellow("\nInterrupted! Saving progress..."));
@@ -1326,8 +1624,13 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
       userSenderManifest.entries.push(...newEntries);
       userSenderManifest.processedEmailIds.push(...newProcessedEmailIds);
       userSenderManifest.lastSync = new Date().toISOString();
-      await saveManifest(manifestPath, manifest);
-      console.log(chalk.green(`✓ Saved ${newEntries.length} files, ${newProcessedEmailIds.length} emails to manifest`));
+      
+      try {
+        await saveManifest(manifestPath, manifest);
+        console.log(chalk.green(`✓ Saved ${newEntries.length} files, ${newProcessedEmailIds.length} emails to manifest`));
+      } catch (saveError) {
+        console.error(chalk.red(`error Failed to save manifest: ${saveError}`));
+      }
     }
 
     process.exit(0);
@@ -1405,46 +1708,58 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
         totalSize += attachment.size || 0;
         logger.debug(`  Would download: ${attachment.name} (${formatSize(attachment.size || 0)})`);
       } else {
-        const fullAttachment = await getAttachment(message.id, attachment.id, accessToken);
+        // Wrap attachment download in try-catch to continue on error
+        try {
+          const fullAttachment = await getAttachment(message.id, attachment.id, accessToken);
 
-        if (fullAttachment.contentBytes) {
-          let safeName = attachment.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+          if (fullAttachment.contentBytes) {
+            let safeName = sanitizeFilename(attachment.name);
 
-          // Add extension for inline images that don't have one (e.g., "image001")
-          const hasExtension = /\.[a-zA-Z0-9]+$/.test(safeName);
-          if (!hasExtension && attachment.contentType) {
-            const ext = CONTENT_TYPE_MAP[attachment.contentType.toLowerCase()];
-            if (ext) safeName += ext;
+            // Add extension for inline images that don't have one (e.g., "image001")
+            const hasExtension = /\.[a-zA-Z0-9]+$/.test(safeName);
+            if (!hasExtension && attachment.contentType) {
+              const ext = CONTENT_TYPE_MAP[attachment.contentType.toLowerCase()];
+              if (ext) safeName += ext;
+            }
+
+            const imageIndex = userSenderManifest.entries.length + newEntries.length + 1;
+            const filename = `${dateStr}_${imageIndex}_${safeName}`;
+            const filepath = join(config.outputDir, filename);
+
+            // Validate path doesn't escape output directory
+            if (!isPathSafe(config.outputDir, filepath)) {
+              logger.warn(`  Skipped (unsafe path): ${attachment.name}`);
+              continue;
+            }
+
+            const buffer = Buffer.from(fullAttachment.contentBytes, "base64");
+            const fileHash = hashBuffer(buffer);
+            await Bun.write(filepath, buffer);
+
+            // Add to new entries for manifest
+            newEntries.push({
+              key: manifestKey,
+              filename,
+              originalName: attachment.name,
+              size: buffer.length,
+              hash: fileHash,
+              emailSubject: subject,
+              emailDate: message.receivedDateTime,
+              downloadedAt: new Date().toISOString(),
+            });
+
+            totalImages++;
+            totalSize += buffer.length;
+            logger.debug(`  Saved: ${filename} (${formatSize(buffer.length)})`);
+
+            // Rate limiting delay for large mailboxes
+            if (useRateLimiting) {
+              await Bun.sleep(DELAY_MS);
+            }
           }
-
-          const imageIndex = userSenderManifest.entries.length + newEntries.length + 1;
-          const filename = `${dateStr}_${imageIndex}_${safeName}`;
-          const filepath = join(config.outputDir, filename);
-
-          const buffer = Buffer.from(fullAttachment.contentBytes, "base64");
-          const fileHash = hashBuffer(buffer);
-          await Bun.write(filepath, buffer);
-
-          // Add to new entries for manifest
-          newEntries.push({
-            key: manifestKey,
-            filename,
-            originalName: attachment.name,
-            size: buffer.length,
-            hash: fileHash,
-            emailSubject: subject,
-            emailDate: message.receivedDateTime,
-            downloadedAt: new Date().toISOString(),
-          });
-
-          totalImages++;
-          totalSize += buffer.length;
-          logger.debug(`  Saved: ${filename} (${formatSize(buffer.length)})`);
-
-          // Rate limiting delay for large mailboxes
-          if (useRateLimiting) {
-            await Bun.sleep(DELAY_MS);
-          }
+        } catch (downloadError) {
+          logger.warn(`  Failed to download attachment "${attachment.name}": ${downloadError instanceof Error ? downloadError.message : downloadError}`);
+          // Continue with next attachment
         }
       }
     }
@@ -1462,13 +1777,27 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
       status: chalk.green("Complete!")
     });
     progressBar.stop();
-  } else {
+  } else if (!options.json) {
     logger.info(`Complete! ${totalImages} new, ${totalSkipped} cached`);
   }
+  
+  // Remove resize listener
+  process.stdout.off("resize", handleResize);
 
   // Remove signal handlers
   process.off("SIGINT", cleanup);
   process.off("SIGTERM", cleanup);
+
+  // Record end time
+  const endTime = new Date();
+
+  // Log finished timestamp
+  logger.dim(`Finished:   ${formatTime(endTime)}`);
+
+  // Check for duplicates BEFORE adding new entries to manifest
+  const allEntries = [...userSenderManifest.entries, ...newEntries];
+  const duplicates = findDuplicates(allEntries);
+  const duplicateCount = duplicates.reduce((sum, g) => sum + g.files.length - 1, 0);
 
   // Save manifest with new entries and processed email IDs
   if (!options.dryRun && (newEntries.length > 0 || newProcessedEmailIds.length > 0)) {
@@ -1479,13 +1808,25 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   }
 
   // Summary
-  const endTime = new Date();
   const duration = endTime.getTime() - startTime.getTime();
 
-  // Check for duplicates
-  const allEntries = [...userSenderManifest.entries, ...newEntries];
-  const duplicates = findDuplicates(allEntries);
-  const duplicateCount = duplicates.reduce((sum, g) => sum + g.files.length - 1, 0);
+  // JSON output mode
+  if (options.json) {
+    const summary: RunSummary = {
+      account: userEmail,
+      sender: config.senderEmail,
+      emailsProcessed: emails.length,
+      emailsSkipped: totalSkippedEmails,
+      filesDownloaded: totalImages,
+      filesSkipped: totalSkipped,
+      totalSize,
+      duplicates: duplicateCount,
+      duration,
+      outputDir: config.outputDir,
+    };
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
 
   console.log();
   console.log(chalk.bold("Summary"));
@@ -1493,6 +1834,9 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   console.log(`  Account:          ${chalk.cyan(userEmail)}`);
   console.log(`  Sender:           ${chalk.green(config.senderEmail)}`);
   console.log(`  Emails processed: ${chalk.cyan(emails.length)}`);
+  if (totalSkippedEmails > 0) {
+    console.log(`  Emails skipped:   ${chalk.dim(totalSkippedEmails)} ${chalk.dim("(already processed)")}`);
+  }
   console.log(`  Files ${options.dryRun ? "found" : "saved"}:      ${chalk.green(totalImages)}`);
   if (totalSkipped > 0) {
     console.log(`  Files skipped:    ${chalk.dim(totalSkipped)} ${chalk.dim("(cached)")}`);
@@ -1561,7 +1905,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
               freed += entry.size;
             }
           }
-          entry.filename = `[deleted] -> ${keep.filename}`;
+          entry.filename = `[deleted] ← ${keep.filename}`;
         }
       }
 
@@ -1586,6 +1930,7 @@ program
   .option("-s, --start <date>", "start date (YYYY-MM-DD)")
   .option("-n, --end <date>", "end date (YYYY-MM-DD)")
   .option("-o, --output <dir>", "output directory")
+  .option("--since <date>", "only process emails after date (YYYY-MM-DD or 'last' for last sync)")
   .option("--dry-run", "preview downloads without saving", false)
   .option("--no-cache", "force re-download all images (ignore manifest)")
   .option("--show-accounts", "list all cached user/sender accounts", false)
@@ -1597,12 +1942,31 @@ program
   .option("-u, --user <email>", "use specific cached account (skip prompt)")
   .option("-v, --verbose", "show detailed logs", false)
   .option("-q, --quiet", "minimal output", false)
+  .option("--stats", "show email/attachment statistics without downloading", false)
+  .option("--json", "output results in JSON format", false)
+  .addHelpText('after', `
+Examples:
+  $ mailgrep                                # Interactive mode
+  $ mailgrep -e sender@example.com          # Download from specific sender
+  $ mailgrep --dry-run -e user@test.com     # Preview without downloading
+  $ mailgrep -e user@test.com --since last  # Only new emails since last sync
+  $ mailgrep --stats -e user@test.com       # Show statistics only
+  $ mailgrep --dedupe                       # Remove duplicate files
+  $ mailgrep --logout                       # Clear cached tokens
+  $ mailgrep -V                             # Show version
+`)
   .action(async (options: CLIOptions) => {
     logger = new Logger(options.verbose, options.quiet);
 
-    // Show banner unless in quiet mode
-    if (!options.quiet) {
+    // Show banner unless in quiet or JSON mode
+    if (!options.quiet && !options.json) {
       showBanner();
+    }
+
+    // Validate --user email format if provided
+    if (options.user && !isValidEmail(options.user)) {
+      console.error(chalk.red(`\nError: Invalid email format for --user: "${options.user}"`));
+      process.exit(ExitCode.ConfigError);
     }
 
     // Handle --logout
@@ -1619,10 +1983,11 @@ program
         for (const token of tokenCache.tokens) {
           console.log(`  ${chalk.cyan(token.userEmail)} (${token.tenantId})`);
         }
+        const count = tokenCache.tokens.length;
         tokenCache.tokens = [];
         await saveTokenCache(tokenCache);
         console.log();
-        console.log(chalk.green("✓ All cached tokens cleared"));
+        console.log(chalk.green(`✓ Cleared ${count} cached token${count !== 1 ? 's' : ''}`));
       }
 
       console.log();
@@ -1696,7 +2061,7 @@ program
         console.log(`  ${chalk.yellow("Wasted space:")}     ${formatSize(totalWastedBytes)}`);
         console.log();
         console.log(chalk.dim("  Note: Duplicates often come from email reply threads."));
-        console.log(chalk.dim("  A future version may add --dedupe to remove them."));
+        console.log(chalk.dim("  Run with --dedupe to remove them automatically."));
       } else {
         console.log(chalk.green("  No duplicates found!"));
       }
@@ -1721,8 +2086,11 @@ program
       let missing = 0;
       let total = 0;
 
+      const totalEntries = manifest.accounts.reduce((sum, acc) => sum + acc.entries.length, 0);
+
       for (const account of manifest.accounts) {
-        for (const entry of account.entries) {
+        for (let j = 0; j < account.entries.length; j++) {
+          const entry = account.entries[j];
           total++;
           if (entry.hash) continue;  // Already has hash
 
@@ -1733,10 +2101,12 @@ program
             const buffer = Buffer.from(await file.arrayBuffer());
             entry.hash = hashBuffer(buffer);
             updated++;
-            process.stdout.write(`\r  Processing: ${updated} files hashed...`);
           } else {
             missing++;
           }
+
+          const percentage = Math.round((total / totalEntries) * 100);
+          process.stdout.write(`\r  Processing: ${total}/${totalEntries} (${percentage}%) - ${updated} hashed...`);
         }
       }
 
@@ -1801,7 +2171,7 @@ program
             }
 
             // Mark as deleted in manifest but keep entry for cache
-            entry.filename = `[deleted] -> ${keep.filename}`;
+            entry.filename = `[deleted] ← ${keep.filename}`;
           }
         }
       }
@@ -1820,6 +2190,126 @@ program
       process.exit(ExitCode.Success);
     }
 
+    // Handle --stats (requires auth and email)
+    if (options.stats) {
+      // Check for Azure credentials first
+      if (!OAUTH_CONFIG.clientId) {
+        console.error(chalk.red("\nError: AZURE_CLIENT_ID not configured\n"));
+        console.log("Create a .env file with:");
+        console.log(chalk.cyan("  AZURE_CLIENT_ID=your-client-id"));
+        console.log(chalk.cyan("  AZURE_TENANT_ID=your-tenant-id"));
+        process.exit(ExitCode.ConfigError);
+      }
+
+      // Use DEFAULT_SENDER from .env if --email not provided
+      const senderEmail = options.email || DEFAULT_SENDER;
+      if (!senderEmail) {
+        console.error(chalk.red("\nError: --stats requires -e/--email option or DEFAULT_SENDER in .env\n"));
+        console.log("Usage: mailgrep --stats -e sender@example.com");
+        process.exit(ExitCode.ConfigError);
+      }
+
+      // Temporarily set options.email for getConfig
+      options.email = senderEmail;
+      const config = await getConfig(options);
+      
+      if (!options.quiet && !options.json) {
+        console.log();
+        logger.dim(`Sender:     ${config.senderEmail}`);
+        logger.dim(`Date range: ${config.startDate} to ${config.endDate}`);
+      }
+
+      // Authenticate
+      const authSpinner = options.json ? null : ora("Authenticating...").start();
+      let accessToken: string;
+      let userEmail: string;
+
+      try {
+        const tokenCache = await loadTokenCache();
+        const cachedToken = getCachedToken(tokenCache, OAUTH_CONFIG.tenantId, options.user);
+
+        if (cachedToken && !isTokenExpired(cachedToken)) {
+          accessToken = cachedToken.accessToken;
+          userEmail = cachedToken.userEmail;
+          authSpinner?.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+        } else if (cachedToken?.refreshToken) {
+          authSpinner && (authSpinner.text = "Refreshing authentication...");
+          const refreshed = await refreshAccessToken(cachedToken.refreshToken);
+          if (refreshed) {
+            accessToken = refreshed.accessToken;
+            userEmail = getUserEmailFromToken(accessToken);
+            authSpinner?.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+          } else {
+            throw new Error("Token refresh failed");
+          }
+        } else {
+          const authResult = await authenticate(authSpinner!);
+          accessToken = authResult.accessToken;
+          userEmail = getUserEmailFromToken(accessToken);
+          authSpinner?.succeed(`Authenticated as ${chalk.cyan(userEmail)}`);
+        }
+      } catch (error) {
+        authSpinner?.fail("Authentication failed");
+        throw error;
+      }
+
+      // Fetch email count
+      const fetchSpinner = options.json ? null : ora("Counting emails...").start();
+      
+      const filterParts = [
+        `receivedDateTime ge ${config.startDate}T00:00:00Z`,
+        `receivedDateTime le ${config.endDate}T23:59:59Z`,
+      ];
+      const filterQuery = encodeURIComponent(filterParts.join(" and "));
+      
+      let url: string | undefined = `https://graph.microsoft.com/v1.0/me/messages?$filter=${filterQuery}&$select=id,from,hasAttachments&$top=${PAGE_SIZE}`;
+      
+      let emailCount = 0;
+      let emailsWithAttachments = 0;
+      
+      while (url) {
+        const response: GraphResponse<Message> = await graphFetch<Message>(url, accessToken);
+        
+        for (const message of response.value) {
+          const fromEmail = message.from?.emailAddress?.address?.toLowerCase() || "";
+          if (fromEmail !== config.senderEmail.toLowerCase()) continue;
+          
+          emailCount++;
+          if (message.hasAttachments) {
+            emailsWithAttachments++;
+          }
+        }
+        
+        url = response["@odata.nextLink"];
+        fetchSpinner && (fetchSpinner.text = `Counting emails... (${emailCount} found)`);
+      }
+      
+      fetchSpinner?.succeed(`Found ${emailCount} emails`);
+
+      // Output stats
+      if (options.json) {
+        console.log(JSON.stringify({
+          account: userEmail,
+          sender: config.senderEmail,
+          dateRange: { start: config.startDate, end: config.endDate },
+          emails: emailCount,
+          emailsWithAttachments,
+        }, null, 2));
+      } else {
+        console.log();
+        console.log(chalk.bold("Statistics"));
+        console.log(chalk.dim("─".repeat(40)));
+        console.log(`  Account:              ${chalk.cyan(userEmail)}`);
+        console.log(`  Sender:               ${chalk.green(config.senderEmail)}`);
+        console.log(`  Date range:           ${config.startDate} to ${config.endDate}`);
+        console.log(`  Total emails:         ${chalk.cyan(emailCount)}`);
+        console.log(`  With attachments:     ${chalk.cyan(emailsWithAttachments)}`);
+        console.log();
+      }
+
+      process.exit(ExitCode.Success);
+    }
+
     // Check for Azure credentials
     if (!OAUTH_CONFIG.clientId) {
       console.error(chalk.red("\nError: AZURE_CLIENT_ID not configured\n"));
@@ -1827,7 +2317,7 @@ program
       console.log(chalk.cyan("  AZURE_CLIENT_ID=your-client-id"));
       console.log(chalk.cyan("  AZURE_TENANT_ID=your-tenant-id"));
       console.log();
-      console.log("See: https://portal.azure.com → App registrations");
+      console.log("See: https://portal.azure.com -> App registrations");
       process.exit(ExitCode.ConfigError);
     }
 
@@ -1840,7 +2330,32 @@ program
         console.error(chalk.red(`\nError: ${error.message}`));
         process.exit(ExitCode.ConfigError);
       }
+      
+      // Check for file system errors
       if (error instanceof Error) {
+        const fsErrorCodes = ["ENOENT", "EACCES", "EPERM", "EROFS", "ENOSPC"];
+        const errorCode = (error as NodeJS.ErrnoException).code;
+        if (errorCode && fsErrorCodes.includes(errorCode)) {
+          console.error(chalk.red(`\nFile system error: ${error.message}`));
+          if (options.verbose) {
+            console.error(error.stack);
+          }
+          process.exit(ExitCode.FileSystemError);
+        }
+        
+        // Check for auth errors
+        if (error.message.includes("OAuth") || 
+            error.message.includes("Token") || 
+            error.message.includes("Authentication") ||
+            error.message.includes("401") ||
+            error.message.includes("403")) {
+          console.error(chalk.red(`\nAuthentication error: ${error.message}`));
+          if (options.verbose) {
+            console.error(error.stack);
+          }
+          process.exit(ExitCode.AuthError);
+        }
+        
         console.error(chalk.red(`\nError: ${error.message}`));
         if (options.verbose) {
           console.error(error.stack);
