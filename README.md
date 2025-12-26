@@ -3,13 +3,14 @@
 Download email attachments from Office 365 with a single command.
 
 ```
-  ╭──────────────────────────────────────╮
-  │                                      │
-  │   mailgrep                           │
-  │   ───────────────────────────────    │
-  │   Like grep, but for your inbox.     │
-  │                                      │
-  ╰──────────────────────────────────────╯
+  ╭────────────────────────────────────────╮
+  │                                        │
+  │    ✦ mailgrep                          │
+  │                                        │
+  │    Like grep, but for your inbox.      │
+  │    Download attachments from O365.     │
+  │                                        │
+  ╰────────────────────────────────────────╯
 ```
 
 ## Features

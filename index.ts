@@ -89,14 +89,26 @@ enum ExitCode {
 // ASCII Banner
 // ============================================
 function showBanner(): void {
+  // Modern minimal CLI banner with gradient colors
+  const purple = chalk.hex("#c084fc");   // Purple-400
+  const blue = chalk.hex("#60a5fa");     // Blue-400
+  const cyan = chalk.hex("#22d3ee");     // Cyan-400
+  const white = chalk.hex("#f1f5f9");    // Slate-100
+  const gray = chalk.hex("#94a3b8");     // Slate-400
+  const dim = chalk.hex("#64748b");      // Slate-500
+  
+  // Gradient effect on the title
+  const title = purple.bold("mail") + blue.bold("grep");
+  
   const banner = `
-  ${chalk.cyan("╭──────────────────────────────────────╮")}
-  ${chalk.cyan("│")}                                      ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.bold.cyan("mail")}${chalk.bold.white("grep")}  ${chalk.dim("v" + VERSION)}                  ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.dim("───────────────────────────────")}   ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.dim("Like grep, but for your inbox.")}    ${chalk.cyan("│")}
-  ${chalk.cyan("│")}                                      ${chalk.cyan("│")}
-  ${chalk.cyan("╰──────────────────────────────────────╯")}
+  ${dim("    ╭────────────────────────────────────────╮")}
+  ${dim("    │")}                                        ${dim("│")}
+  ${dim("    │")}    ${cyan("✦")} ${title}  ${dim("v" + VERSION)}                 ${dim("│")}
+  ${dim("    │")}                                        ${dim("│")}
+  ${dim("    │")}    ${gray("Like grep, but for your inbox.")}     ${dim("│")}
+  ${dim("    │")}    ${gray("Download attachments from O365.")}    ${dim("│")}
+  ${dim("    │")}                                        ${dim("│")}
+  ${dim("    ╰────────────────────────────────────────╯")}
 `;
   console.log(banner);
 }
