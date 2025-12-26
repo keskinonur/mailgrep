@@ -4,6 +4,11 @@ node_modules/
 # output
 downloads/
 archive/
+dist/
+
+# backup files
+*.zip
+*.bak
 
 # binaries
 mailgrep

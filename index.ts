@@ -66,11 +66,13 @@ const ALLOWED_EXTENSIONS = FILE_TYPES_RAW === "*"
   ? null  // null means allow all
   : FILE_TYPES_RAW.split(",").map(ext => `.${ext.trim().toLowerCase()}`);
 
-// Rate limiting - adaptive delay for large mailboxes
-// Kicks in when email count >= threshold to avoid hitting Graph API limits
+// Rate limiting and concurrency settings
 // Graph API limit: ~10,000 requests per 10 minutes per app
-const LARGE_MAILBOX_THRESHOLD = 500;  // emails
-const DELAY_MS = 50;                  // ms between attachment downloads
+// With parallel downloads, we can process much faster while staying under limits
+const LARGE_MAILBOX_THRESHOLD = 500;  // emails - enables rate limiting
+const DELAY_MS = 50;                  // ms between batches (not individual downloads)
+const CONCURRENT_DOWNLOADS = 5;       // parallel attachment downloads
+const BATCH_SIZE = 10;                // emails to process in parallel
 
 // ============================================
 // Exit Codes
@@ -88,16 +90,13 @@ enum ExitCode {
 // ============================================
 function showBanner(): void {
   const banner = `
-  ${chalk.cyan("┌─────────────────────────────────────────┐")}
-  ${chalk.cyan("│")}                                         ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.bold.white("╔╦╗╔═╗╦╦  ╔═╗╦═╗╔═╗╔═╗")}                ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.bold.white("║║║╠═╣║║  ║ ╦╠╦╝║╣ ╠═╝")}                ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.bold.white("╩ ╩╩ ╩╩╩═╝╚═╝╩╚═╚═╝╩")}                  ${chalk.cyan("│")}
-  ${chalk.cyan("│")}                                         ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.dim("Like grep, but for your mailbox.")}      ${chalk.cyan("│")}
-  ${chalk.cyan("│")}   ${chalk.dim(`v${VERSION}`)}                                ${chalk.cyan("│")}
-  ${chalk.cyan("│")}                                         ${chalk.cyan("│")}
-  ${chalk.cyan("└─────────────────────────────────────────┘")}
+  ${chalk.cyan("╭──────────────────────────────────────╮")}
+  ${chalk.cyan("│")}                                      ${chalk.cyan("│")}
+  ${chalk.cyan("│")}   ${chalk.bold.cyan("mail")}${chalk.bold.white("grep")}  ${chalk.dim("v" + VERSION)}                  ${chalk.cyan("│")}
+  ${chalk.cyan("│")}   ${chalk.dim("───────────────────────────────")}   ${chalk.cyan("│")}
+  ${chalk.cyan("│")}   ${chalk.dim("Like grep, but for your inbox.")}    ${chalk.cyan("│")}
+  ${chalk.cyan("│")}                                      ${chalk.cyan("│")}
+  ${chalk.cyan("╰──────────────────────────────────────╯")}
 `;
   console.log(banner);
 }
@@ -1506,7 +1505,9 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   const filterQuery = encodeURIComponent(filterParts.join(" and "));
 
   // Graph API pagination: follow @odata.nextLink until exhausted
-  let url: string | undefined = `https://graph.microsoft.com/v1.0/me/messages?$filter=${filterQuery}&$orderby=receivedDateTime desc&$select=id,subject,receivedDateTime,from,hasAttachments&$top=${PAGE_SIZE}`;
+  // Using $expand=attachments to get attachment metadata in single call (saves 1 API call per email)
+  // Note: $expand only returns metadata, contentBytes requires separate call per attachment
+  let url: string | undefined = `https://graph.microsoft.com/v1.0/me/messages?$filter=${filterQuery}&$orderby=receivedDateTime desc&$select=id,subject,receivedDateTime,from,hasAttachments&$expand=attachments($select=id,name,contentType,size,isInline)&$top=${PAGE_SIZE}`;
 
   const emails: Message[] = [];
 
@@ -1639,6 +1640,67 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
+  // Helper function to download and save a single attachment
+  interface DownloadTask {
+    message: Message;
+    attachment: Attachment;
+    manifestKey: string;
+  }
+
+  const downloadAttachment = async (task: DownloadTask): Promise<{ success: boolean; size: number; entry?: ManifestEntry }> => {
+    const { message, attachment, manifestKey } = task;
+    const dateStr = message.receivedDateTime.slice(0, 10);
+    const subject = message.subject || "(no subject)";
+
+    try {
+      const fullAttachment = await getAttachment(message.id, attachment.id, accessToken);
+
+      if (fullAttachment.contentBytes) {
+        let safeName = sanitizeFilename(attachment.name);
+
+        // Add extension for inline images that don't have one (e.g., "image001")
+        const hasExtension = /\.[a-zA-Z0-9]+$/.test(safeName);
+        if (!hasExtension && attachment.contentType) {
+          const ext = CONTENT_TYPE_MAP[attachment.contentType.toLowerCase()];
+          if (ext) safeName += ext;
+        }
+
+        const imageIndex = userSenderManifest.entries.length + newEntries.length + 1;
+        const filename = `${dateStr}_${imageIndex}_${safeName}`;
+        const filepath = join(config.outputDir, filename);
+
+        // Validate path doesn't escape output directory
+        if (!isPathSafe(config.outputDir, filepath)) {
+          logger.warn(`  Skipped (unsafe path): ${attachment.name}`);
+          return { success: false, size: 0 };
+        }
+
+        const buffer = Buffer.from(fullAttachment.contentBytes, "base64");
+        const fileHash = hashBuffer(buffer);
+        await Bun.write(filepath, buffer);
+
+        const entry: ManifestEntry = {
+          key: manifestKey,
+          filename,
+          originalName: attachment.name,
+          size: buffer.length,
+          hash: fileHash,
+          emailSubject: subject,
+          emailDate: message.receivedDateTime,
+          downloadedAt: new Date().toISOString(),
+        };
+
+        logger.debug(`  Saved: ${filename} (${formatSize(buffer.length)})`);
+        return { success: true, size: buffer.length, entry };
+      }
+      return { success: false, size: 0 };
+    } catch (downloadError) {
+      logger.warn(`  Failed to download "${attachment.name}": ${downloadError instanceof Error ? downloadError.message : downloadError}`);
+      return { success: false, size: 0 };
+    }
+  };
+
+  // Process emails - collect download tasks first, then execute in parallel
   for (let i = 0; i < emails.length; i++) {
     const message = emails[i];
     const dateStr = message.receivedDateTime.slice(0, 10);
@@ -1667,17 +1729,24 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
       continue;
     }
 
-    // Note: hasAttachments can be false for inline images (embedded via CID)
-    // We check all emails to catch inline images too, unless already processed
-    // This costs one extra API call per email but ensures we don't miss inline images
+    // Use attachments from $expand if available, otherwise fetch separately
+    // $expand gives us metadata; we still need to fetch contentBytes for each
+    let attachments: Attachment[] = message.attachments || [];
+    
+    // If no attachments from $expand (shouldn't happen), fetch them
+    if (attachments.length === 0 && message.hasAttachments) {
+      logger.debug(`  Fetching attachments (fallback)...`);
+      const attachmentsUrl = `https://graph.microsoft.com/v1.0/me/messages/${message.id}/attachments`;
+      const attachmentsResponse: GraphResponse<Attachment> = await graphFetch<Attachment>(attachmentsUrl, accessToken);
+      attachments = attachmentsResponse.value;
+    }
 
-    logger.debug(`  Fetching attachments...`);
-    const attachmentsUrl = `https://graph.microsoft.com/v1.0/me/messages/${message.id}/attachments`;
-    const attachmentsResponse: GraphResponse<Attachment> = await graphFetch<Attachment>(attachmentsUrl, accessToken);
+    logger.debug(`  Found ${attachments.length} attachment(s)`);
 
-    logger.debug(`  Found ${attachmentsResponse.value.length} attachment(s)`);
+    // Collect download tasks for this email
+    const downloadTasks: DownloadTask[] = [];
 
-    for (const attachment of attachmentsResponse.value) {
+    for (const attachment of attachments) {
       logger.debug(`    Attachment: "${attachment.name}" (${attachment.contentType}, inline=${attachment.isInline})`);
 
       if (!isAllowedFile(attachment)) {
@@ -1693,73 +1762,46 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
         continue;
       }
 
-      // Update spinner on each attachment
-      spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
-      if (useProgressBar) {
-        progressBar.update(i, {
-          spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
-          skipped: totalSkipped,
-          status: chalk.green(truncate(attachment.name, 25))
-        });
-      }
-
       if (options.dryRun) {
         totalImages++;
         totalSize += attachment.size || 0;
         logger.debug(`  Would download: ${attachment.name} (${formatSize(attachment.size || 0)})`);
       } else {
-        // Wrap attachment download in try-catch to continue on error
-        try {
-          const fullAttachment = await getAttachment(message.id, attachment.id, accessToken);
+        downloadTasks.push({ message, attachment, manifestKey });
+      }
+    }
 
-          if (fullAttachment.contentBytes) {
-            let safeName = sanitizeFilename(attachment.name);
+    // Execute downloads in parallel with concurrency limit
+    if (downloadTasks.length > 0 && !options.dryRun) {
+      // Process in chunks of CONCURRENT_DOWNLOADS
+      for (let j = 0; j < downloadTasks.length; j += CONCURRENT_DOWNLOADS) {
+        const chunk = downloadTasks.slice(j, j + CONCURRENT_DOWNLOADS);
+        
+        // Update status with current attachment
+        if (useProgressBar && chunk.length > 0) {
+          spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
+          progressBar.update(i, {
+            spinner: chalk.cyan(spinnerFrames[spinnerIndex]),
+            skipped: totalSkipped,
+            status: chalk.green(truncate(chunk[0].attachment.name, 25))
+          });
+        }
 
-            // Add extension for inline images that don't have one (e.g., "image001")
-            const hasExtension = /\.[a-zA-Z0-9]+$/.test(safeName);
-            if (!hasExtension && attachment.contentType) {
-              const ext = CONTENT_TYPE_MAP[attachment.contentType.toLowerCase()];
-              if (ext) safeName += ext;
-            }
+        // Download chunk in parallel
+        const results = await Promise.all(chunk.map(task => downloadAttachment(task)));
 
-            const imageIndex = userSenderManifest.entries.length + newEntries.length + 1;
-            const filename = `${dateStr}_${imageIndex}_${safeName}`;
-            const filepath = join(config.outputDir, filename);
-
-            // Validate path doesn't escape output directory
-            if (!isPathSafe(config.outputDir, filepath)) {
-              logger.warn(`  Skipped (unsafe path): ${attachment.name}`);
-              continue;
-            }
-
-            const buffer = Buffer.from(fullAttachment.contentBytes, "base64");
-            const fileHash = hashBuffer(buffer);
-            await Bun.write(filepath, buffer);
-
-            // Add to new entries for manifest
-            newEntries.push({
-              key: manifestKey,
-              filename,
-              originalName: attachment.name,
-              size: buffer.length,
-              hash: fileHash,
-              emailSubject: subject,
-              emailDate: message.receivedDateTime,
-              downloadedAt: new Date().toISOString(),
-            });
-
+        // Process results
+        for (const result of results) {
+          if (result.success && result.entry) {
+            newEntries.push(result.entry);
             totalImages++;
-            totalSize += buffer.length;
-            logger.debug(`  Saved: ${filename} (${formatSize(buffer.length)})`);
-
-            // Rate limiting delay for large mailboxes
-            if (useRateLimiting) {
-              await Bun.sleep(DELAY_MS);
-            }
+            totalSize += result.size;
           }
-        } catch (downloadError) {
-          logger.warn(`  Failed to download attachment "${attachment.name}": ${downloadError instanceof Error ? downloadError.message : downloadError}`);
-          // Continue with next attachment
+        }
+
+        // Rate limiting delay between chunks for large mailboxes
+        if (useRateLimiting && j + CONCURRENT_DOWNLOADS < downloadTasks.length) {
+          await Bun.sleep(DELAY_MS);
         }
       }
     }
