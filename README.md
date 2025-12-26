@@ -22,6 +22,8 @@ Download email attachments from Office 365 with a single command.
 - **Configurable Filters** - Download images, PDFs, documents, or all attachments
 - **Multi-Account** - Supports multiple Office 365 accounts
 - **Cross-Platform** - Runs on macOS, Linux, and Windows
+- **JSON Output** - CI/CD friendly output for automation
+- **Statistics Mode** - Quick email/attachment counts without downloading
 
 ## Quick Start
 
@@ -52,9 +54,21 @@ mailgrep -e sender@company.com -s 2025-01-01 -n 2025-12-31
 # Preview without downloading
 mailgrep -e sender@company.com --dry-run
 
+# Only download emails since last sync
+mailgrep -e sender@company.com --since last
+
+# Quick statistics (no download)
+mailgrep --stats -e sender@company.com
+
+# JSON output for scripting
+mailgrep --json -e sender@company.com
+
 # Find and remove duplicates
 mailgrep --check-duplicates
 mailgrep --dedupe
+
+# Show version
+mailgrep -V
 ```
 
 ### All Options
@@ -65,7 +79,10 @@ mailgrep --dedupe
 | `-s, --start <date>` | Start date (YYYY-MM-DD) |
 | `-n, --end <date>` | End date (YYYY-MM-DD) |
 | `-o, --output <dir>` | Output directory |
+| `--since <date>` | Only process emails after date (YYYY-MM-DD or 'last') |
 | `--dry-run` | Preview without downloading |
+| `--stats` | Show email/attachment statistics without downloading |
+| `--json` | Output results in JSON format |
 | `--no-cache` | Force re-download all files |
 | `--show-accounts` | List cached accounts |
 | `--check-duplicates` | Analyze duplicate files |
@@ -74,8 +91,71 @@ mailgrep --dedupe
 | `--logout` | Clear cached auth tokens |
 | `--reauth` | Force browser re-authentication |
 | `-u, --user <email>` | Use specific cached account |
-| `-v, --verbose` | Detailed output |
+| `-v, --verbose` | Detailed output (includes API response times) |
 | `-q, --quiet` | Minimal output |
+| `-V, --version` | Show version number |
+
+### Incremental Sync with `--since`
+
+The `--since` option enables efficient incremental syncing:
+
+```bash
+# Sync only emails from a specific date
+mailgrep -e sender@company.com --since 2025-01-01
+
+# Sync only emails since last successful run
+mailgrep -e sender@company.com --since last
+```
+
+When using `--since last`, mailgrep reads the last sync timestamp from the manifest. If no prior sync exists, it falls back to the default start date (January 1st of current year).
+
+### JSON Output for Automation
+
+The `--json` flag outputs results in a structured format, ideal for CI/CD pipelines:
+
+```bash
+mailgrep --json -e sender@company.com
+```
+
+Output:
+```json
+{
+  "account": "user@company.com",
+  "sender": "sender@company.com",
+  "emailsProcessed": 150,
+  "emailsSkipped": 45,
+  "filesDownloaded": 23,
+  "filesSkipped": 89,
+  "totalSize": 15728640,
+  "duplicates": 5,
+  "duration": 12345,
+  "outputDir": "/path/to/downloads"
+}
+```
+
+### Statistics Mode
+
+Get quick counts without downloading anything:
+
+```bash
+mailgrep --stats -e sender@company.com
+```
+
+Output:
+```
+Statistics
+────────────────────────────────────────
+  Account:              user@company.com
+  Sender:               sender@company.com
+  Date range:           2025-01-01 to 2025-12-26
+  Total emails:         150
+  With attachments:     42
+```
+
+Combine with `--json` for scripting:
+```bash
+mailgrep --stats --json -e sender@company.com
+```
 
 ## Configuration
 
@@ -135,14 +215,25 @@ mailgrep --user user1@company.com -e sender@example.com
 
 | Cache | Location | Purpose |
 |-------|----------|---------|
-| Auth tokens | `~/.mailgrep/tokens.json` | OAuth access/refresh tokens |
+| Auth tokens | `~/.mailgrep/tokens.json` | OAuth access/refresh tokens (chmod 600) |
 | Download manifest | `<output-dir>/manifest.json` | Tracks downloaded files |
+| Manifest backup | `<output-dir>/manifest.json.bak` | Backup before each update |
 
 Use `--output` to change the download directory (and manifest location):
 
 ```bash
 mailgrep -o ~/backups/mail --show-accounts
 ```
+
+## Security
+
+Mailgrep implements several security measures:
+
+- **Token Storage** - Auth tokens stored with restrictive permissions (chmod 600)
+- **Path Validation** - Prevents directory traversal attacks in filenames
+- **Input Sanitization** - All user inputs validated before use
+- **XSS Prevention** - OAuth error pages escape HTML content
+- **Manifest Backup** - Automatic backup before each manifest update
 
 ## Azure AD Setup
 
@@ -168,6 +259,24 @@ bun run build:all
 | macOS | `bun run build` | `mailgrep` |
 | Linux | `bun run build:linux` | `mailgrep-linux-x64` |
 | Windows | `bun run build:windows` | `mailgrep-windows-x64.exe` |
+
+## Troubleshooting
+
+### Port 8400 already in use
+
+If you see "Port 8400 is already in use", another mailgrep instance may be running. Close it or wait for the OAuth timeout (5 minutes).
+
+### Authentication timeout
+
+The OAuth browser flow times out after 5 minutes. If you don't complete login in time, run the command again.
+
+### Network errors
+
+Mailgrep automatically retries failed requests with exponential backoff. If you see persistent network errors, check your internet connection.
+
+### Rate limiting
+
+For large mailboxes (500+ emails), mailgrep automatically enables rate limiting to avoid hitting Microsoft Graph API limits.
 
 ## License
 
