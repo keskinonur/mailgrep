@@ -247,6 +247,7 @@ Mailgrep implements several security measures:
 - **Manifest Backup** - Automatic backup before each manifest update
 - **Timeout Protection** - All network calls have timeouts to prevent hangs
 - **Retry with Backoff** - Automatic retry with exponential backoff for transient failures
+- **Contextual Errors** - API errors include endpoint, status code, and retry count for debugging
 
 ## Azure AD Setup
 
@@ -270,6 +271,14 @@ git clone https://github.com/keskinonur/mailgrep.git
 cd mailgrep
 bun install
 ```
+
+### Running Tests
+
+```bash
+bun test
+```
+
+Tests cover manifest operations, hash functions, duplicate detection, and security helpers.
 
 ### Type Checking
 

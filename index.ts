@@ -221,7 +221,20 @@ interface Manifest {
 }
 
 /**
- * Validates that an object conforms to the Manifest schema
+ * Validates that an object conforms to the Manifest schema.
+ * Used when loading manifest files to ensure data integrity.
+ *
+ * @param obj - The object to validate
+ * @returns True if the object is a valid Manifest, false otherwise
+ *
+ * @example
+ * ```typescript
+ * const data = JSON.parse(fileContent);
+ * if (isValidManifest(data)) {
+ *   // data is typed as Manifest
+ *   console.log(data.accounts.length);
+ * }
+ * ```
  */
 function isValidManifest(obj: unknown): obj is Manifest {
   if (typeof obj !== "object" || obj === null) return false;
@@ -277,7 +290,17 @@ const OAUTH_CONFIG = {
 // ============================================
 
 /**
- * Escapes HTML special characters to prevent XSS attacks
+ * Escapes HTML special characters to prevent XSS attacks.
+ * Used in OAuth callback pages to safely display error messages.
+ *
+ * @param unsafe - The string containing potentially unsafe HTML characters
+ * @returns The escaped string safe for HTML insertion
+ *
+ * @example
+ * ```typescript
+ * escapeHtml('<script>alert("xss")</script>')
+ * // Returns: '&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;'
+ * ```
  */
 function escapeHtml(unsafe: string): string {
   return unsafe
@@ -289,14 +312,36 @@ function escapeHtml(unsafe: string): string {
 }
 
 /**
- * Validates email format
+ * Validates email address format using a basic regex pattern.
+ * Also enforces maximum length per RFC 5321.
+ *
+ * @param email - The email address to validate
+ * @returns True if the email format is valid, false otherwise
+ *
+ * @example
+ * ```typescript
+ * isValidEmail('user@example.com')  // true
+ * isValidEmail('invalid')           // false
+ * isValidEmail('user @test.com')    // false (space not allowed)
+ * ```
  */
 function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length < 254;
 }
 
 /**
- * Sanitizes filename to prevent path traversal attacks
+ * Sanitizes a filename by removing potentially dangerous characters.
+ * Prevents path traversal attacks and ensures filesystem compatibility.
+ *
+ * @param filename - The original filename to sanitize
+ * @returns A safe filename with dangerous characters replaced by underscores
+ *
+ * @example
+ * ```typescript
+ * sanitizeFilename('../../../etc/passwd')  // '_.._.._.._etc_passwd'
+ * sanitizeFilename('my file.jpg')          // 'my_file.jpg'
+ * sanitizeFilename('photo<script>.png')    // 'photo_script_.png'
+ * ```
  */
 function sanitizeFilename(filename: string): string {
   return filename
@@ -306,7 +351,19 @@ function sanitizeFilename(filename: string): string {
 }
 
 /**
- * Validates that a filepath doesn't escape the output directory
+ * Validates that a filepath stays within the designated output directory.
+ * Prevents path traversal attacks by resolving paths and checking containment.
+ *
+ * @param outputDir - The allowed base directory
+ * @param filepath - The filepath to validate
+ * @returns True if the filepath is safely within outputDir, false otherwise
+ *
+ * @example
+ * ```typescript
+ * isPathSafe('/downloads', '/downloads/image.jpg')      // true
+ * isPathSafe('/downloads', '/downloads/../etc/passwd') // false
+ * isPathSafe('/downloads', '/other/path/file.jpg')     // false
+ * ```
  */
 function isPathSafe(outputDir: string, filepath: string): boolean {
   const resolvedOutput = resolve(outputDir);
@@ -535,6 +592,19 @@ function getTenantIdFromToken(accessToken: string): string | null {
 // ============================================
 const MANIFEST_VERSION = 1;
 
+/**
+ * Loads a manifest file from disk, returning a fresh manifest if the file
+ * doesn't exist or contains invalid data.
+ *
+ * @param path - The absolute path to the manifest.json file
+ * @returns The loaded Manifest or a fresh empty Manifest
+ *
+ * @example
+ * ```typescript
+ * const manifest = await loadManifest('/downloads/manifest.json');
+ * console.log(manifest.accounts.length); // 0 if new
+ * ```
+ */
 async function loadManifest(path: string): Promise<Manifest> {
   try {
     const file = Bun.file(path);
@@ -556,6 +626,21 @@ async function loadManifest(path: string): Promise<Manifest> {
   };
 }
 
+/**
+ * Saves a manifest file to disk with backup creation.
+ * Creates a .bak backup of the existing file before overwriting.
+ * Updates the manifest's updatedAt timestamp automatically.
+ *
+ * @param path - The absolute path to save the manifest.json file
+ * @param manifest - The Manifest object to save
+ * @throws Error if writing fails (disk full, permissions, etc.)
+ *
+ * @example
+ * ```typescript
+ * manifest.accounts[0].lastSync = new Date().toISOString();
+ * await saveManifest('/downloads/manifest.json', manifest);
+ * ```
+ */
 async function saveManifest(path: string, manifest: Manifest): Promise<void> {
   // Backup existing manifest before overwriting
   const file = Bun.file(path);
@@ -573,6 +658,26 @@ async function saveManifest(path: string, manifest: Manifest): Promise<void> {
   await Bun.write(path, JSON.stringify(manifest, null, 2));
 }
 
+/**
+ * Gets or creates a user-sender manifest entry.
+ * The manifest tracks downloads per (userEmail, senderEmail) pair,
+ * enabling multi-account support.
+ *
+ * @param manifest - The parent Manifest object
+ * @param userEmail - The authenticated user's email
+ * @param senderEmail - The sender email being tracked
+ * @returns The existing or newly created UserSenderManifest
+ *
+ * @example
+ * ```typescript
+ * const account = getOrCreateUserSenderManifest(
+ *   manifest,
+ *   'me@company.com',
+ *   'orders@vendor.com'
+ * );
+ * account.entries.push(newEntry);
+ * ```
+ */
 function getOrCreateUserSenderManifest(
   manifest: Manifest,
   userEmail: string,
@@ -602,18 +707,48 @@ function getOrCreateUserSenderManifest(
   return account;
 }
 
+/**
+ * Gets a Set of all downloaded attachment keys from a manifest account.
+ * Keys are composite: "messageId|attachmentId".
+ *
+ * @param account - The UserSenderManifest to extract keys from
+ * @returns A Set of downloaded attachment keys for O(1) lookup
+ */
 function getDownloadedKeys(account: UserSenderManifest): Set<string> {
   return new Set(account.entries.map((e) => e.key));
 }
 
+/**
+ * Gets a Set of all processed email IDs from a manifest account.
+ * Used to skip re-fetching attachments for already-processed emails.
+ *
+ * @param account - The UserSenderManifest to extract IDs from
+ * @returns A Set of processed email IDs for O(1) lookup
+ */
 function getProcessedEmailIds(account: UserSenderManifest): Set<string> {
   return new Set(account.processedEmailIds || []);
 }
 
+/**
+ * Creates a composite key for uniquely identifying an attachment.
+ * Combines messageId and attachmentId to handle cases where the same
+ * attachment appears in multiple emails (e.g., forwards).
+ *
+ * @param messageId - The Graph API message ID
+ * @param attachmentId - The Graph API attachment ID
+ * @returns A composite key in format "messageId|attachmentId"
+ */
 function createManifestKey(messageId: string, attachmentId: string): string {
   return `${messageId}|${attachmentId}`;
 }
 
+/**
+ * Computes SHA-256 hash of a buffer for duplicate detection.
+ * Used to identify identical files across different emails.
+ *
+ * @param buffer - The file content buffer to hash
+ * @returns 64-character lowercase hex string of the SHA-256 hash
+ */
 function hashBuffer(buffer: Buffer): string {
   return new Bun.CryptoHasher("sha256").update(buffer).digest("hex");
 }
@@ -623,6 +758,22 @@ interface DuplicateGroup {
   files: ManifestEntry[];
 }
 
+/**
+ * Finds duplicate files by comparing SHA-256 hashes.
+ * Duplicates are common in email threads where attachments are included
+ * in replies.
+ *
+ * @param entries - Array of ManifestEntry objects to analyze
+ * @returns Array of DuplicateGroup objects, each containing 2+ files with identical hashes
+ *
+ * @example
+ * ```typescript
+ * const duplicates = findDuplicates(account.entries);
+ * for (const group of duplicates) {
+ *   console.log(`Hash ${group.hash}: ${group.files.length} copies`);
+ * }
+ * ```
+ */
 function findDuplicates(entries: ManifestEntry[]): DuplicateGroup[] {
   const hashMap = new Map<string, ManifestEntry[]>();
 
@@ -1000,7 +1151,22 @@ function errorPage(message: string): string {
 // Microsoft Graph API is the unified endpoint for Microsoft 365 services
 // Docs: https://learn.microsoft.com/en-us/graph/api/overview
 
-async function graphFetch<T>(url: string, accessToken: string, retryCount: number = 0): Promise<GraphResponse<T>> {
+/**
+ * Makes a Graph API request with automatic retry and rate limiting handling.
+ *
+ * @param url - The Graph API endpoint URL
+ * @param accessToken - OAuth access token
+ * @param operation - Human-readable description of the operation (for error context)
+ * @param retryCount - Current retry attempt (internal, starts at 0)
+ * @returns The parsed JSON response
+ * @throws {GraphApiError} On API failures after retries exhausted
+ */
+async function graphFetch<T>(
+  url: string,
+  accessToken: string,
+  operation: string = "fetch data",
+  retryCount: number = 0
+): Promise<GraphResponse<T>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   const startTime = Date.now();
@@ -1015,7 +1181,7 @@ async function graphFetch<T>(url: string, accessToken: string, retryCount: numbe
     });
 
     clearTimeout(timeout);
-    
+
     // Log response time in verbose mode
     logger?.debug(`Graph API: ${response.status} (${Date.now() - startTime}ms)`);
 
@@ -1024,37 +1190,81 @@ async function graphFetch<T>(url: string, accessToken: string, retryCount: numbe
       // Graph API returns Retry-After header with seconds to wait
       if (response.status === 429) {
         if (retryCount >= MAX_RETRY_ATTEMPTS) {
-          throw new Error(`Rate limit exceeded after ${MAX_RETRY_ATTEMPTS} retries`);
+          throw new GraphApiError({
+            message: "Rate limit exceeded",
+            operation,
+            endpoint: url,
+            statusCode: 429,
+            retryCount,
+          });
         }
         const retryAfter = response.headers.get("Retry-After");
         const baseDelay = retryAfter ? parseInt(retryAfter) : DEFAULT_RETRY_DELAY_SEC;
         const waitSeconds = retryAfter ? baseDelay : baseDelay * Math.pow(2, retryCount);
         logger.warn(`Rate limited. Waiting ${waitSeconds}s... (attempt ${retryCount + 1}/${MAX_RETRY_ATTEMPTS})`);
         await Bun.sleep(waitSeconds * 1000);
-        return graphFetch<T>(url, accessToken, retryCount + 1);  // Retry with incremented count
+        return graphFetch<T>(url, accessToken, operation, retryCount + 1);
       }
+
       const errorText = await response.text();
-      throw new Error(`Graph API error: ${response.status} - ${errorText}`);
+      throw new GraphApiError({
+        message: errorText || `HTTP ${response.status}`,
+        operation,
+        endpoint: url,
+        statusCode: response.status,
+        retryCount,
+      });
     }
 
     return response.json();
   } catch (error) {
     clearTimeout(timeout);
-    
+
+    // Re-throw GraphApiError as-is
+    if (error instanceof GraphApiError) {
+      throw error;
+    }
+
     // Retry on transient network failures (timeout/abort errors)
     if (error instanceof Error && (error.name === "AbortError" || error.message.includes("fetch failed"))) {
       if (retryCount < MAX_RETRY_ATTEMPTS) {
         const waitSeconds = DEFAULT_RETRY_DELAY_SEC * Math.pow(2, retryCount);
         logger?.warn(`Network error. Retrying in ${waitSeconds}s... (attempt ${retryCount + 1}/${MAX_RETRY_ATTEMPTS})`);
         await Bun.sleep(waitSeconds * 1000);
-        return graphFetch<T>(url, accessToken, retryCount + 1);
+        return graphFetch<T>(url, accessToken, operation, retryCount + 1);
       }
+
+      // Max retries exhausted - wrap in contextual error
+      throw new GraphApiError({
+        message: error.name === "AbortError" ? "Request timed out" : "Network connection failed",
+        operation,
+        endpoint: url,
+        retryCount,
+        cause: error,
+      });
     }
-    
-    throw error;
+
+    // Wrap unknown errors with context
+    throw new GraphApiError({
+      message: error instanceof Error ? error.message : String(error),
+      operation,
+      endpoint: url,
+      retryCount,
+      cause: error instanceof Error ? error : undefined,
+    });
   }
 }
 
+/**
+ * Downloads a single attachment from a message.
+ *
+ * @param messageId - The Graph API message ID
+ * @param attachmentId - The Graph API attachment ID
+ * @param accessToken - OAuth access token
+ * @param retryCount - Current retry attempt (internal, starts at 0)
+ * @returns The Attachment object with contentBytes
+ * @throws {GraphApiError} On download failures after retries exhausted
+ */
 async function getAttachment(
   messageId: string,
   attachmentId: string,
@@ -1062,6 +1272,7 @@ async function getAttachment(
   retryCount: number = 0
 ): Promise<Attachment> {
   const url = `https://graph.microsoft.com/v1.0/me/messages/${messageId}/attachments/${attachmentId}`;
+  const operation = "download attachment";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   const startTime = Date.now();
@@ -1073,7 +1284,7 @@ async function getAttachment(
     });
 
     clearTimeout(timeout);
-    
+
     // Log response time in verbose mode
     logger?.debug(`Attachment API: ${response.status} (${Date.now() - startTime}ms)`);
 
@@ -1081,7 +1292,13 @@ async function getAttachment(
       // Handle rate limiting (429 Too Many Requests)
       if (response.status === 429) {
         if (retryCount >= MAX_RETRY_ATTEMPTS) {
-          throw new Error(`Rate limit exceeded after ${MAX_RETRY_ATTEMPTS} retries`);
+          throw new GraphApiError({
+            message: "Rate limit exceeded",
+            operation,
+            endpoint: url,
+            statusCode: 429,
+            retryCount,
+          });
         }
         const retryAfter = response.headers.get("Retry-After");
         const baseDelay = retryAfter ? parseInt(retryAfter) : DEFAULT_RETRY_DELAY_SEC;
@@ -1090,13 +1307,25 @@ async function getAttachment(
         await Bun.sleep(waitSeconds * 1000);
         return getAttachment(messageId, attachmentId, accessToken, retryCount + 1);
       }
-      throw new Error(`Failed to fetch attachment: ${response.status}`);
+
+      throw new GraphApiError({
+        message: `HTTP ${response.status}`,
+        operation,
+        endpoint: url,
+        statusCode: response.status,
+        retryCount,
+      });
     }
 
     return response.json();
   } catch (error) {
     clearTimeout(timeout);
-    
+
+    // Re-throw GraphApiError as-is
+    if (error instanceof GraphApiError) {
+      throw error;
+    }
+
     // Retry on transient network failures (timeout/abort errors)
     if (error instanceof Error && (error.name === "AbortError" || error.message.includes("fetch failed"))) {
       if (retryCount < MAX_RETRY_ATTEMPTS) {
@@ -1105,9 +1334,25 @@ async function getAttachment(
         await Bun.sleep(waitSeconds * 1000);
         return getAttachment(messageId, attachmentId, accessToken, retryCount + 1);
       }
+
+      // Max retries exhausted
+      throw new GraphApiError({
+        message: error.name === "AbortError" ? "Request timed out" : "Network connection failed",
+        operation,
+        endpoint: url,
+        retryCount,
+        cause: error,
+      });
     }
-    
-    throw error;
+
+    // Wrap unknown errors with context
+    throw new GraphApiError({
+      message: error instanceof Error ? error.message : String(error),
+      operation,
+      endpoint: url,
+      retryCount,
+      cause: error instanceof Error ? error : undefined,
+    });
   }
 }
 
@@ -1176,6 +1421,69 @@ class DateValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DateValidationError";
+  }
+}
+
+/**
+ * Custom error class for Graph API failures with context.
+ * Provides detailed information about what operation failed and why.
+ */
+class GraphApiError extends Error {
+  /** HTTP status code if available */
+  readonly statusCode?: number;
+  /** The API endpoint that was called */
+  readonly endpoint: string;
+  /** The operation being performed (e.g., "fetch emails", "download attachment") */
+  readonly operation: string;
+  /** Number of retry attempts made before failure */
+  readonly retryCount: number;
+  /** Original error if this wraps another error */
+  readonly cause?: Error;
+
+  constructor(options: {
+    message: string;
+    operation: string;
+    endpoint: string;
+    statusCode?: number;
+    retryCount?: number;
+    cause?: Error;
+  }) {
+    const contextMsg = `${options.operation} failed: ${options.message}`;
+    super(contextMsg);
+    this.name = "GraphApiError";
+    this.operation = options.operation;
+    this.endpoint = options.endpoint;
+    this.statusCode = options.statusCode;
+    this.retryCount = options.retryCount || 0;
+    this.cause = options.cause;
+  }
+
+  /**
+   * Returns a user-friendly error message with context.
+   */
+  toUserMessage(): string {
+    const parts = [this.message];
+    if (this.statusCode) {
+      parts.push(`(HTTP ${this.statusCode})`);
+    }
+    if (this.retryCount > 0) {
+      parts.push(`after ${this.retryCount} retries`);
+    }
+    return parts.join(" ");
+  }
+
+  /**
+   * Returns detailed debug information.
+   */
+  toDebugString(): string {
+    return [
+      `GraphApiError: ${this.message}`,
+      `  Operation: ${this.operation}`,
+      `  Endpoint: ${this.endpoint}`,
+      this.statusCode ? `  Status: ${this.statusCode}` : null,
+      this.retryCount ? `  Retries: ${this.retryCount}` : null,
+      this.cause ? `  Cause: ${this.cause.message}` : null,
+    ].filter(Boolean).join("\n");
   }
 }
 
@@ -1524,7 +1832,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
   const emails: Message[] = [];
 
   while (url) {
-    const response: GraphResponse<Message> = await graphFetch<Message>(url, accessToken);
+    const response: GraphResponse<Message> = await graphFetch<Message>(url, accessToken, "fetch emails");
 
     for (const message of response.value) {
       // Client-side sender filter (more reliable than OData filter on sender)
@@ -1752,7 +2060,7 @@ async function run(options: CLIOptions, forceReauth: boolean = false): Promise<v
     if (attachments.length === 0 && message.hasAttachments) {
       logger.debug(`  Fetching attachments (fallback)...`);
       const attachmentsUrl = `https://graph.microsoft.com/v1.0/me/messages/${message.id}/attachments`;
-      const attachmentsResponse: GraphResponse<Attachment> = await graphFetch<Attachment>(attachmentsUrl, accessToken);
+      const attachmentsResponse: GraphResponse<Attachment> = await graphFetch<Attachment>(attachmentsUrl, accessToken, "fetch attachments list");
       attachments = attachmentsResponse.value;
     }
 
@@ -2327,12 +2635,12 @@ Examples:
       let emailsWithAttachments = 0;
       
       while (url) {
-        const response: GraphResponse<Message> = await graphFetch<Message>(url, accessToken);
-        
+        const response: GraphResponse<Message> = await graphFetch<Message>(url, accessToken, "count emails");
+
         for (const message of response.value) {
           const fromEmail = message.from?.emailAddress?.address?.toLowerCase() || "";
           if (fromEmail !== config.senderEmail.toLowerCase()) continue;
-          
+
           emailCount++;
           if (message.hasAttachments) {
             emailsWithAttachments++;
@@ -2389,7 +2697,20 @@ Examples:
         console.error(chalk.red(`\nError: ${error.message}`));
         process.exit(ExitCode.ConfigError);
       }
-      
+
+      // Handle Graph API errors with context
+      if (error instanceof GraphApiError) {
+        console.error(chalk.red(`\n${error.toUserMessage()}`));
+        if (options.verbose) {
+          console.error(chalk.dim(error.toDebugString()));
+        }
+        // Determine exit code based on status
+        if (error.statusCode === 401 || error.statusCode === 403) {
+          process.exit(ExitCode.AuthError);
+        }
+        process.exit(ExitCode.NetworkError);
+      }
+
       // Check for file system errors
       if (error instanceof Error) {
         const fsErrorCodes = ["ENOENT", "EACCES", "EPERM", "EROFS", "ENOSPC"];
@@ -2401,10 +2722,10 @@ Examples:
           }
           process.exit(ExitCode.FileSystemError);
         }
-        
+
         // Check for auth errors
-        if (error.message.includes("OAuth") || 
-            error.message.includes("Token") || 
+        if (error.message.includes("OAuth") ||
+            error.message.includes("Token") ||
             error.message.includes("Authentication") ||
             error.message.includes("401") ||
             error.message.includes("403")) {
@@ -2414,7 +2735,7 @@ Examples:
           }
           process.exit(ExitCode.AuthError);
         }
-        
+
         console.error(chalk.red(`\nError: ${error.message}`));
         if (options.verbose) {
           console.error(error.stack);
